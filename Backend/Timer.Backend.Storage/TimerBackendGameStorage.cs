@@ -134,8 +134,10 @@ public sealed class TimerBackendGameStorage
     public Task<IReadOnlyDictionary<int, double>> GetStyleFactorsAsync(CancellationToken cancellationToken = default)
         => _owner.ExecuteAsync(Storage.GetStyleFactorsAsync, cancellationToken);
 
-    public Task SaveStyleFactorsAsync(IReadOnlyDictionary<int, double> factors, CancellationToken cancellationToken = default)
-        => _owner.ExecuteAsync(() => Done(Storage.SaveStyleFactorsAsync(factors)), cancellationToken);
+    public Task SaveStyleFactorsAsync(IReadOnlyDictionary<int, double> factors,
+                                      bool overwriteExisting = true,
+                                      CancellationToken cancellationToken = default)
+        => _owner.ExecuteAsync(() => Done(Storage.SaveStyleFactorsAsync(factors, overwriteExisting)), cancellationToken);
 
     public Task<IReadOnlyList<TimerBackendRankedPlayer>> GetTopPlayersAsync(int limit, CancellationToken cancellationToken = default)
         => _owner.ExecuteAsync(() => Storage.GetTopPlayersAsync(limit), cancellationToken);

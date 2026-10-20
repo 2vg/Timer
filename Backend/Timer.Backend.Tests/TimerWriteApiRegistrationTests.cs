@@ -63,6 +63,23 @@ public sealed class TimerWriteApiRegistrationTests
         }
     }
 
+    [Fact]
+    public void EnabledWriteApiWithoutAPortGateRefusesToRegister()
+    {
+        // Without LocalPorts every HTTP/2 listener (e.g. a public TLS read port) would serve unauthenticated writes.
+        var values = new Dictionary<string, string?>
+        {
+            ["TimerBackend:WriteApi:Enabled"] = "true",
+            ["TimerBackend:WriteApi:StyleFactors:0"] = "1",
+        };
+        var gateless = TimerWriteApiOptions.FromConfiguration(new ConfigurationBuilder().AddInMemoryCollection(values).Build());
+        Assert.Throws<InvalidOperationException>(() => TimerWriteApiRegistration.Add(new ServiceCollection(), gateless));
+
+        values["TimerBackend:WriteApi:AllowAllListeners"] = "true";
+        var optedIn = TimerWriteApiOptions.FromConfiguration(new ConfigurationBuilder().AddInMemoryCollection(values).Build());
+        TimerWriteApiRegistration.Add(new ServiceCollection(), optedIn);
+    }
+
     private static Task<WebApplication> BuildAndMapAsync(TimerWriteApiOptions options)
     {
         var builder = WebApplication.CreateBuilder();
@@ -80,6 +97,7 @@ public sealed class TimerWriteApiRegistrationTests
             ["TimerBackend:WriteApi:Enabled"] = "true",
             ["TimerBackend:WriteApi:RulesetVersion"] = "7",
             ["TimerBackend:WriteApi:StyleFactors:0"] = "1",
+            ["TimerBackend:WriteApi:LocalPorts:0"] = "5082",
         };
         return TimerWriteApiOptions.FromConfiguration(new ConfigurationBuilder().AddInMemoryCollection(values).Build());
     }

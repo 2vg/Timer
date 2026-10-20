@@ -2,7 +2,9 @@
   // Timer.Backend owns the database: every record, zone and map read or write goes through it.
   "backend": {
     // Its gRPC address. Empty means a backend on this machine with its default port: "http://127.0.0.1:5082".
-    "endpoint": ""
+    "endpoint": "",
+    // Only when the backend sets WriteApi:Authentication:Mode=ApiKey: this server's key. Use https:// off this host.
+    "api_key": ""
   },
   "chat": {
     // Before every timer chat message. [lime]-style colour tags work, as they do in the locale's chat texts.

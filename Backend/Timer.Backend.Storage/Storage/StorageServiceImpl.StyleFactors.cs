@@ -11,8 +11,9 @@ internal sealed partial class StorageServiceImpl
     public async Task<IReadOnlyDictionary<int, double>> GetStyleFactorsAsync()
         => (await _db.Queryable<StyleFactorEntity>().ToListAsync(OperationCancellation)).ToDictionary(x => x.Style, x => x.Factor);
 
-    // Upserts only: servers sharing the database may not all run every style.
-    public async Task SaveStyleFactorsAsync(IReadOnlyDictionary<int, double> factors)
+    // Upserts only: servers sharing the database may not all run every style. Without overwriteExisting a caller
+    // can add styles nobody registered yet but cannot change a factor another server or an operator set.
+    public async Task SaveStyleFactorsAsync(IReadOnlyDictionary<int, double> factors, bool overwriteExisting = true)
     {
         var now      = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var existing = await GetStyleFactorsAsync();
@@ -21,7 +22,7 @@ internal sealed partial class StorageServiceImpl
         {
             if (existing.TryGetValue(style, out var current))
             {
-                if (current != factor)
+                if (overwriteExisting && current != factor)
                 {
                     await _db.Updateable<StyleFactorEntity>()
                              .SetColumns(x => x.Factor == factor)
@@ -40,6 +41,11 @@ internal sealed partial class StorageServiceImpl
             }
             catch (Exception ex) when (IsUniqueKeyViolation(ex))
             {
+                if (!overwriteExisting)
+                {
+                    continue; // A concurrent registration won; keep its factor.
+                }
+
                 await _db.Updateable<StyleFactorEntity>()
                          .SetColumns(x => x.Factor == factor)
                          .SetColumns(x => x.UpdatedAtUnixMilliseconds == now)

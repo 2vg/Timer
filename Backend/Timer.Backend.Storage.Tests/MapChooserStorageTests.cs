@@ -10,6 +10,8 @@ using Xunit;
 namespace Timer.Backend.Storage.Tests;
 
 // What the map chooser reads: every map with its tiers and workshop item, and which maps a player has finished.
+// "Every map, adding none" is checked by counting the whole table, so no other test may create maps meanwhile.
+[Collection(SqlSchemaMutationCollection.Name)]
 public sealed class MapChooserStorageTests
 {
     [Fact]

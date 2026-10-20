@@ -76,12 +76,15 @@ public sealed class PlayerSettingsStorageTests
 
         await store.SaveStyleFactorsAsync(new Dictionary<int, double> { [0] = 1, [1] = 0.5 });
         await store.SaveStyleFactorsAsync(new Dictionary<int, double> { [1] = 0.25, [2] = 0 });
+        // A caller that may not change the shared policy can only add styles nobody registered yet.
+        await store.SaveStyleFactorsAsync(new Dictionary<int, double> { [0] = 100, [3] = 2 }, overwriteExisting: false);
 
         var factors = await store.GetStyleFactorsAsync();
-        Assert.Equal(3, factors.Count);
+        Assert.Equal(4, factors.Count);
         Assert.Equal(1, factors[0]);
         Assert.Equal(0.25, factors[1]);
         Assert.Equal(0, factors[2]);
+        Assert.Equal(2, factors[3]);
     }
 
     private sealed class Fixture : IDisposable

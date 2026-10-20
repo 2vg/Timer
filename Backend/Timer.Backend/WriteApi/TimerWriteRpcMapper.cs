@@ -78,7 +78,8 @@ internal static class TimerWriteRpcMapper
             throw TimerWriteRpcErrors.RulesetMismatch();
         }
 
-        if ((uint)request.Style >= TimerConstants.MAX_STYLE)
+        // unchecked: a negative style must be rejected, not throw OverflowException in checked builds.
+        if (unchecked((uint)request.Style) >= TimerConstants.MAX_STYLE)
         {
             throw TimerWriteRpcErrors.InvalidArgument();
         }

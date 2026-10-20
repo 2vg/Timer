@@ -41,13 +41,16 @@ internal sealed partial class StorageServiceImpl
 
         // Backend writes are authoritative but never provision maps. Doing this preflight
         // outside the record transaction avoids holding a lock just to report a 404; the
-        // map is locked/rechecked immediately inside the write transaction below.
-        var map = await FindMapByNameAsync(submission.MapName);
-        if (map is null)
+        // map is locked/rechecked immediately inside the write transaction below. Map rows are
+        // never deleted, so the cached id of an exact name stays valid.
+        var mapId = await FindSubmissionMapIdAsync(submission.MapName);
+        if (mapId is not { } resolvedMapId)
         {
             if (!acceptNewWrites) throw new TimerBackendSubmissionPolicyException();
             throw new TimerBackendMapNotFoundException(submission.MapName);
         }
+
+        var map = (MapId: resolvedMapId, MapName: submission.MapName);
 
         if (!acceptNewWrites)
         {
@@ -76,6 +79,13 @@ internal sealed partial class StorageServiceImpl
             checked((ushort)submission.Track),
             checked((ushort)submission.Stage));
 
+        // A missing player is intentionally an explicit domain failure. Players are never deleted,
+        // so checking before the map lock is as good as inside it and keeps the lock short.
+        if (!await _db.Queryable<PlayerEntity>().Where(x => x.SteamId == submission.SteamId).AnyAsync(OperationCancellation))
+        {
+            throw new TimerBackendPlayerNotFoundException(submission.SteamId);
+        }
+
         TimerBackendRunSubmissionResult? result = null;
         var wakeScoreRecalcWorker = false;
 
@@ -88,23 +98,12 @@ internal sealed partial class StorageServiceImpl
                 result = null;
                 wakeScoreRecalcWorker = false;
 
-                // Required ordering: map lock, second inbox check, run/best mutation, then the
-                // inbox row. The lock serializes same-map finishes and record removal.
+                // The map lock serializes same-map finishes and record removal, so everything
+                // after it is on every same-map writer's critical path: only the run, best-run and
+                // inbox writes happen here. A concurrent duplicate of this submission is not
+                // re-checked under the lock: the inbox unique key rejects the later insert, the
+                // whole attempt rolls back, and the catch below returns the committed receipt.
                 await LockMapAsync(map.MapId);
-
-                var inTransactionExisting = await FindSubmissionAsync(submission.SubmissionIdText);
-                if (inTransactionExisting is not null)
-                {
-                    result = ToExistingSubmissionResult(inTransactionExisting, submission);
-                    return;
-                }
-
-                // A missing player is intentionally an explicit domain failure. Nothing is
-                // written yet, so the player can be provisioned and the run retried later.
-                if (!await _db.Queryable<PlayerEntity>().Where(x => x.SteamId == submission.SteamId).AnyAsync(OperationCancellation))
-                {
-                    throw new TimerBackendPlayerNotFoundException(submission.SteamId);
-                }
 
                 var run = CreateBackendRunEntity(submission, map.MapId);
                 var write = await WriteRunInCurrentRecordTransactionAsync(
@@ -134,19 +133,12 @@ internal sealed partial class StorageServiceImpl
                     RankState = (byte)rankState,
                     Rank = rank,
                     FinishedAtUtc = submission.FinishedAtUtc,
-                    ReceivedAtUtc = DateTime.UtcNow,
+                    // Whole seconds: every supported column type (including existing MySQL DATETIME
+                    // columns, which round fractions) stores this exactly, so the first receipt
+                    // equals what retries and status lookups read back without a query under the lock.
+                    ReceivedAtUtc = TruncateToSecond(DateTime.UtcNow),
                 };
                 inbox.Id = unchecked((ulong)await _db.Insertable(inbox).ExecuteReturnBigIdentityAsync(OperationCancellation));
-
-                // The SQL column's timestamp precision can differ from DateTime.UtcNow
-                // (existing MySQL DATETIME columns commonly retain whole seconds). Read
-                // the durable value before COMMIT so the first receipt has exactly the
-                // same timestamp as retries/status, and a read failure still rolls back.
-                inbox.ReceivedAtUtc = await _db.Queryable<RunSubmissionEntity>()
-                    .Where(x => x.Id == inbox.Id)
-                    .Select(x => (DateTime?)x.ReceivedAtUtc)
-                    .FirstAsync(OperationCancellation)
-                    ?? throw new InvalidOperationException("Finalized submission receipt was not found.");
                 result = ToStoredSubmissionResult(
                     inbox, submission.SubmissionId, TimerBackendSubmissionDisposition.Accepted);
                 wakeScoreRecalcWorker = write.WakeScoreRecalcWorker;
@@ -236,6 +228,26 @@ internal sealed partial class StorageServiceImpl
         };
     }
 
+    private static DateTime TruncateToSecond(DateTime value)
+        => new (value.Ticks - value.Ticks % TimeSpan.TicksPerSecond, value.Kind);
+
+    // Exact-name lookup as before (submission names are not case-folded), served from the map id cache.
+    private async Task<ulong?> FindSubmissionMapIdAsync(string mapName)
+    {
+        if (TryGetCachedMapId(mapName, out var cached))
+        {
+            return cached;
+        }
+
+        if (await FindMapByNameAsync(mapName) is not { } map)
+        {
+            return null;
+        }
+
+        CacheMapId(mapName, map);
+        return map.MapId;
+    }
+
     private static RunEntity CreateBackendRunEntity(NormalizedSubmission submission, ulong mapId)
         => new ()
         {
@@ -323,8 +335,9 @@ internal sealed partial class StorageServiceImpl
             throw new TimerBackendSubmissionValidationException("Run kind is invalid.");
         }
 
-        if ((uint)command.Style >= TimerConstants.MAX_STYLE
-            || (uint)command.Track >= TimerConstants.MAX_TRACK)
+        // unchecked: negative values must fail validation, not throw OverflowException in checked builds.
+        if (unchecked((uint)command.Style) >= TimerConstants.MAX_STYLE
+            || unchecked((uint)command.Track) >= TimerConstants.MAX_TRACK)
         {
             throw new TimerBackendSubmissionValidationException("Style or track is outside the supported range.");
         }

@@ -41,8 +41,8 @@ dotnet run -c Release --no-launch-profile --project Backend/Timer.Backend/Timer.
 
 It serves HTTP on `127.0.0.1:5081` (`/health/ready`) and gRPC on `127.0.0.1:5082`.
 Start it before the game server. A game server on another host sets
-`backend.endpoint` in `timer.jsonc`. gRPC has no authentication: keep it on a
-private network. Upgrading an existing database, and the rest:
+`backend.endpoint` in `timer.jsonc`. By default gRPC has no authentication: keep it on a
+private network, or enable per-server API keys (`backend.api_key`). Upgrading an existing database, and the rest:
 [Backend documentation](Backend/Timer.Backend/README.md).
 
 ## Configuration

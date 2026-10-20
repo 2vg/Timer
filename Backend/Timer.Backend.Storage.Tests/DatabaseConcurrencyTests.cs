@@ -14,6 +14,10 @@ namespace Timer.Backend.Storage.Tests;
 
 // These tests require an explicitly supplied disposable database. They create
 // uniquely named maps/players and never connect to application configuration.
+// Outbox workers scan, claim and count the whole score-recalc Outbox, and the lock barriers
+// assume no competing load: tests running alongside that queue score work for their own maps
+// (any personal best does) make claims, counts and barrier timings nondeterministic.
+[Collection(SqlSchemaMutationCollection.Name)]
 public sealed class DatabaseConcurrencyTests(ITestOutputHelper output)
 {
     [DatabaseFact("TIMER_TEST_MYSQL")]

@@ -34,7 +34,7 @@ internal sealed class BackendOptions
     internal static readonly FrozenSet<string> Keys = FrozenSet.ToFrozenSet(
     [
         "endpoint", "ruleset_version", "rpc_deadline_milliseconds", "poll_interval_milliseconds",
-        "shutdown_drain_timeout_milliseconds", "batch_size",
+        "shutdown_drain_timeout_milliseconds", "batch_size", "api_key",
     ], StringComparer.OrdinalIgnoreCase);
 
     private const int DefaultBatchSize = 16;
@@ -55,6 +55,11 @@ internal sealed class BackendOptions
     public TimeSpan ShutdownDrainTimeout { get; }
 
     public int BatchSize { get; }
+
+    /// <summary>
+    /// Sent as <c>authorization: Bearer</c> when the backend's write API uses ApiKey authentication; null sends none.
+    /// </summary>
+    public string? ApiKey { get; private init; }
 
     private BackendOptions(Uri      endpoint,
                            TimeSpan rpcDeadline,
@@ -108,6 +113,7 @@ internal sealed class BackendOptions
         return new BackendOptions(endpoint, rpcDeadline, pollInterval, shutdownDrainTimeout, batchSize)
         {
             FromScoreWriteSection = legacy,
+            ApiKey                = ParseApiKey(section["api_key"]),
         };
     }
 
@@ -208,6 +214,23 @@ internal sealed class BackendOptions
 
         ValidateEndpoint(endpoint);
         return endpoint;
+    }
+
+    // Printable ASCII without spaces, as the backend accepts; at most its 256-character limit.
+    private static string? ParseApiKey(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        var key = raw.Trim();
+        if (key.Length > 256 || key.AsSpan().ContainsAnyExceptInRange('!', '~'))
+        {
+            throw new InvalidOperationException($"{SectionName}:api_key must be at most 256 printable ASCII characters without spaces.");
+        }
+
+        return key;
     }
 
     private static void ValidateEndpoint(Uri endpoint)

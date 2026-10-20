@@ -47,7 +47,6 @@ public sealed class BackendOptionsTests
     }
 
     [Theory]
-    [InlineData("api_key")]
     [InlineData("server_id")]
     [InlineData("mode")]
     [InlineData("enabled")]
@@ -57,6 +56,19 @@ public sealed class BackendOptionsTests
             BackendOptions.FromConfiguration(Build(("endpoint", "http://timer.example:5082"),
                                                    (setting, "obsolete"))));
     }
+
+    [Fact]
+    public void ApiKeyIsOptionalAndTrimmed()
+    {
+        Assert.Null(BackendOptions.FromConfiguration(Build(("endpoint", "https://timer.example"))).ApiKey);
+        Assert.Equal("k3y-value", BackendOptions.FromConfiguration(Build(("api_key", "  k3y-value "))).ApiKey);
+    }
+
+    [Theory]
+    [InlineData("has space")]
+    [InlineData("non-ascii-é")]
+    public void ApiKeyTheBackendWouldRefuseFailsFast(string key)
+        => Assert.Throws<InvalidOperationException>(() => BackendOptions.FromConfiguration(Build(("api_key", key))));
 
     private static IConfiguration Build(params (string Name, string Value)[] settings)
     {

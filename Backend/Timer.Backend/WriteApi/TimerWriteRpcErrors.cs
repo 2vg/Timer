@@ -35,6 +35,12 @@ internal static class TimerWriteRpcErrors
     public static RpcException NotServedOnListener()
         => new (new Status(StatusCode.Unimplemented, NotServedOnListenerMessage));
 
+    public static RpcException Unauthenticated()
+        => new (new Status(StatusCode.Unauthenticated, "The write API requires a valid API key."));
+
+    public static RpcException PermissionDenied()
+        => new (new Status(StatusCode.PermissionDenied, "The caller may not perform this operation."));
+
     public static RpcException Translate(Exception exception, ILogger logger)
     {
         ArgumentNullException.ThrowIfNull(exception);
@@ -55,6 +61,8 @@ internal static class TimerWriteRpcErrors
             TimerBackendSubmissionConflictException => new RpcException(new Status(StatusCode.AlreadyExists, ConflictMessage)),
             TimerBackendSubmissionPolicyException => RulesetMismatch(),
             TimerBackendUnavailableException => LogAndUnavailable(exception, logger),
+            // Storage's own range checks on client-supplied values: a client error, so no Error log per call.
+            ArgumentException => LogAndInvalidArgument(exception, logger),
             _ => LogAndInternal(exception, logger),
         };
     }
@@ -68,6 +76,12 @@ internal static class TimerWriteRpcErrors
     {
         logger.LogWarning(exception, "Timer write RPC failed because the database is unavailable.");
         return new RpcException(new Status(StatusCode.Unavailable, UnavailableMessage));
+    }
+
+    private static RpcException LogAndInvalidArgument(Exception exception, ILogger logger)
+    {
+        logger.LogDebug(exception, "Timer write RPC rejected an out-of-range argument.");
+        return InvalidArgument();
     }
 
     private static RpcException LogAndInternal(Exception exception, ILogger logger)

@@ -267,7 +267,7 @@ internal sealed partial class StorageServiceImpl
     public async Task<MapProfile> GetMapInfo(string map)
     {
         var mapKey  = ToMapKey(map);
-        var mapInfo = await EnsureMapEntityByKeyAsync(mapKey, map);
+        var mapInfo = await EnsureMapEntityByKeyAsync(mapKey, map, mayRebind: true);
 
         var trackTiers = await _db.Queryable<MapTrackEntity>()
                                   .Where(x => x.MapId == mapInfo.MapId)

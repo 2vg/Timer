@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.OutputCaching;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -20,22 +21,39 @@ internal static class TimerReadEndpoints
 {
     public static void Map(IEndpointRouteBuilder endpoints)
     {
+        var runtime = endpoints.ServiceProvider.GetService<TimerBackendRuntimeOptions>() ?? new TimerBackendRuntimeOptions();
+
         var health = endpoints.MapGroup("/health")
                               .WithTags("Health");
         health.WithRequestTimeout("TimerHealth");
 
         health.MapGet("/live", () => TypedResults.Ok(new HealthStatusDto { Status = "live" }))
               .Produces<HealthStatusDto>(StatusCodes.Status200OK);
-        health.MapGet("/ready", GetReadinessAsync)
+
+        // The probes that query the database share the read limit and, when configured, stay on internal ports.
+        var probes = health.MapGroup(string.Empty)
+                           .RequireRateLimiting(TimerBackendRuntimeRegistration.ReadDatabasePolicy);
+        if (runtime.InternalHealthPorts.Count != 0)
+        {
+            var ports = runtime.InternalHealthPorts;
+            probes.AddEndpointFilter((context, next) =>
+                ports.Contains(context.HttpContext.Connection.LocalPort)
+                    ? next(context)
+                    : ValueTask.FromResult<object?>(Results.NotFound()));
+        }
+
+        probes.MapGet("/ready", GetReadinessAsync)
               .Produces<HealthStatusDto>(StatusCodes.Status200OK)
                .Produces<ApiErrorDto>(StatusCodes.Status503ServiceUnavailable);
-        health.MapGet("/worker", GetWorkerHealthAsync)
+        probes.MapGet("/worker", GetWorkerHealthAsync)
               .Produces<WorkerHealthStatusDto>(StatusCodes.Status200OK)
               .Produces<WorkerHealthStatusDto>(StatusCodes.Status503ServiceUnavailable);
 
         var api = endpoints.MapGroup($"/api/{ApiVersions.V1}")
                             .WithTags("Timer read API");
         api.WithRequestTimeout("TimerRead");
+        // After the output cache in the pipeline, so only misses take a database slot.
+        api.RequireRateLimiting(TimerBackendRuntimeRegistration.ReadDatabasePolicy);
 
         api.MapGet("/maps", GetMapCatalogAsync)
            .Produces<MapListResponse>(StatusCodes.Status200OK);
@@ -44,13 +62,13 @@ internal static class TimerReadEndpoints
            .Produces<ApiErrorDto>(StatusCodes.Status400BadRequest)
            .Produces<ApiErrorDto>(StatusCodes.Status404NotFound);
         api.MapGet("/maps/{mapName}/leaderboard", GetMainLeaderboardAsync)
-           .CacheOutput("TimerLeaderboard")
+           .CacheOutput(TimerBackendRuntimeRegistration.LeaderboardCachePolicy)
            .Produces<RecordListResponse>(StatusCodes.Status200OK)
            .Produces(StatusCodes.Status304NotModified)
            .Produces<ApiErrorDto>(StatusCodes.Status400BadRequest)
            .Produces<ApiErrorDto>(StatusCodes.Status404NotFound);
         api.MapGet("/maps/{mapName}/stage-leaderboard", GetStageLeaderboardAsync)
-           .CacheOutput("TimerLeaderboard")
+           .CacheOutput(TimerBackendRuntimeRegistration.LeaderboardCachePolicy)
            .Produces<RecordListResponse>(StatusCodes.Status200OK)
            .Produces(StatusCodes.Status304NotModified)
            .Produces<ApiErrorDto>(StatusCodes.Status400BadRequest)
@@ -131,7 +149,7 @@ internal static class TimerReadEndpoints
                                                            HttpContext         context,
                                                            TimerBackendStorage storage)
     {
-        if (!ApiRouteValidation.TryNormalizeMapName(mapName, out var canonicalMapName, out var error))
+        if (!ApiRouteValidation.TryParseRouteMapName(mapName, out var canonicalMapName, out var error))
         {
             return ApiErrors.BadRequest(context, "invalid_map_name", error);
         }
@@ -172,7 +190,7 @@ internal static class TimerReadEndpoints
                                                             TimerBackendStorage storage,
                                                           ILoggerFactory      loggerFactory)
     {
-        if (!ApiRouteValidation.TryNormalizeMapName(mapName, out var canonicalMapName, out var error))
+        if (!ApiRouteValidation.TryParseRouteMapName(mapName, out var canonicalMapName, out var error))
         {
             return ApiErrors.BadRequest(context, "invalid_map_name", error);
         }
@@ -211,7 +229,11 @@ internal static class TimerReadEndpoints
         context.Response.Headers["ETag"] = entityTag;
         context.Response.Headers["Cache-Control"] = "public, max-age=15";
 
-        if (EntityTags.Matches(context.Request, entityTag))
+        // When the output cache will store this response, answer 200 even to a matching If-None-Match: a 304 is
+        // never cached, so after each expiry every polling client would otherwise reach the database until some
+        // unconditional request refilled the entry. The cache then answers later conditional hits with 304 itself.
+        var cacheWillStore = context.Features.Get<IOutputCacheFeature>()?.Context.AllowCacheStorage == true;
+        if (!cacheWillStore && EntityTags.Matches(context.Request, entityTag))
         {
             return TypedResults.StatusCode(StatusCodes.Status304NotModified);
         }
@@ -232,18 +254,26 @@ internal static class TimerReadEndpoints
         var checkpoints = await storage.GetRecordCheckpointsAsync(unchecked((long)parsedRunId), context.RequestAborted);
         var response = new List<RunCheckpointDto>(checkpoints.Count);
 
+        var skipped = 0;
+        long firstSkippedId = 0;
         foreach (var checkpoint in checkpoints)
         {
             if (TimerDtoMapper.TryToDto(checkpoint, out var dto))
             {
                 response.Add(dto);
             }
-            else
+            else if (skipped++ == 0)
             {
-                loggerFactory.CreateLogger("Timer.Backend.ReadApi")
-                             .LogWarning("Skipping checkpoint {CheckpointId} of run {RunId} with an unrepresentable stored time {Time}.",
-                                         checkpoint.Id, checkpoint.RecordId, checkpoint.Time);
+                firstSkippedId = checkpoint.Id;
             }
+        }
+
+        if (skipped != 0)
+        {
+            // Once per request, not per row: a corrupt run must not turn each anonymous read into a log burst.
+            loggerFactory.CreateLogger("Timer.Backend.ReadApi")
+                         .LogWarning("Skipped {Count} checkpoints of run {RunId} with unrepresentable stored times, first {CheckpointId}.",
+                                     skipped, parsedRunId, firstSkippedId);
         }
 
         return TypedResults.Ok(response.ToArray());
@@ -375,7 +405,7 @@ internal static class TimerReadEndpoints
             return false;
         }
 
-        if (!ApiRouteValidation.TryNormalizeMapName(mapName, out canonicalMapName, out error))
+        if (!ApiRouteValidation.TryParseRouteMapName(mapName, out canonicalMapName, out error))
         {
             errorResult = ApiErrors.BadRequest(context, "invalid_map_name", error);
             return false;
@@ -387,6 +417,8 @@ internal static class TimerReadEndpoints
     private static RunRecordDto[] ToRecordDtos(IReadOnlyList<RunRecord> records, ILoggerFactory loggerFactory)
     {
         var result = new List<RunRecordDto>(records.Count);
+        var skipped = 0;
+        RunRecord? firstSkipped = null;
 
         foreach (var record in records)
         {
@@ -394,13 +426,19 @@ internal static class TimerReadEndpoints
             {
                 result.Add(dto);
             }
-            else
+            else if (skipped++ == 0)
             {
                 // One corrupt legacy row must not turn the whole list into a 500.
-                loggerFactory.CreateLogger("Timer.Backend.ReadApi")
-                             .LogWarning("Skipping run {RunId} with an unrepresentable stored time {Time}.",
-                                         record.Id, record.Time);
+                firstSkipped = record;
             }
+        }
+
+        if (firstSkipped is not null)
+        {
+            // Once per request, not per row: up to 5,000 rows must not become 5,000 log lines per anonymous read.
+            loggerFactory.CreateLogger("Timer.Backend.ReadApi")
+                         .LogWarning("Skipped {Count} runs with unrepresentable stored times, first run {RunId} ({Time}).",
+                                     skipped, firstSkipped.Id, firstSkipped.Time);
         }
 
         return result.ToArray();

@@ -29,6 +29,8 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
     private const int    MaxTopPlayers  = 50;
     private const double MaxStyleFactor = 100;
     private const int MaxRankedLookups = 64; // a full server
+    private const int MaxStoredReplayLookups = 1000; // the plugin's chunk size
+    private const int MaxReplayUrlLength = 1024;
 
     private readonly TimerBackendStorage            _owner;
     private readonly TimerBackendGameStorage        _storage;
@@ -68,7 +70,7 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
         });
 
     public async UnaryResult IncrementMapStatsAsync(string mapName, ulong workshopId, float deltaSeconds)
-        => await RunAsync(token => Done(_storage.IncrementMapStatsAsync(Map(mapName), workshopId, deltaSeconds, token)));
+        => await RunAsync(token => Done(_storage.IncrementMapStatsAsync(Map(mapName), workshopId, Delta(deltaSeconds), token)));
 
     public async UnaryResult<ScoreJobsDto> SetMapTierAsync(string mapName, ulong workshopId, byte tier)
         => await RunAsync(async token =>
@@ -101,7 +103,8 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
                                                              int     limit)
         => await RunAsync(async token => TimerStorageRpcMapper.ToDto(
                               await _storage.GetMapRecordsAsync(Map(mapName), workshopId, Stage(kind), allBoards,
-                                                                style, track, stage, Limit(limit), token)));
+                                                                Style(style), Track(track), StageNumber(stage),
+                                                                Limit(limit), token)));
 
     public async UnaryResult<RecordDto[]> GetPlayerRecordsAsync(ulong steamId, string mapName, ulong workshopId, RunKind kind)
         => await RunAsync(async token => TimerStorageRpcMapper.ToDto(
@@ -119,8 +122,8 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
                                                              int    stage,
                                                              int    limit)
         => await RunAsync(async token => TimerStorageRpcMapper.ToDto(
-                              await _storage.GetPlayerRunsAsync(Map(mapName), workshopId, steamId, style, track, stage,
-                                                                Limit(limit), token)));
+                              await _storage.GetPlayerRunsAsync(Map(mapName), workshopId, steamId, Style(style),
+                                                                Track(track), StageNumber(stage), Limit(limit), token)));
 
     public async UnaryResult<RecordCheckpointDto[]> GetRecordCheckpointsAsync(long recordId)
         => await RunAsync(async token => TimerStorageRpcMapper.ToDto(await _owner.GetRecordCheckpointsAsync(recordId, token)));
@@ -145,7 +148,7 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
 
     public async UnaryResult<Dictionary<ulong, float>> GetCompletedMapsAsync(ulong steamId, int style, int track)
         => await RunAsync(async token => new Dictionary<ulong, float>(
-                              await _storage.GetCompletedMapsAsync(steamId, style, track, token)));
+                              await _storage.GetCompletedMapsAsync(steamId, Style(style), Track(track), token)));
 
     public async UnaryResult<RankDto> GetPlayerPointsRankAsync(ulong steamId)
         => await RunAsync(async token =>
@@ -159,7 +162,7 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
         => await RunAsync(async token =>
         {
             if (factors is not { Count: > 0 } || !factors.ContainsKey(0)
-                || factors.Any(f => (uint) f.Key >= TimerConstants.MAX_STYLE || !double.IsFinite(f.Value) || f.Value is < 0 or > MaxStyleFactor))
+                || factors.Any(f => unchecked((uint) f.Key) >= TimerConstants.MAX_STYLE || !double.IsFinite(f.Value) || f.Value is < 0 or > MaxStyleFactor))
             {
                 throw TimerWriteRpcErrors.InvalidArgument();
             }
@@ -169,7 +172,11 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
                 return false;
             }
 
-            await _storage.SaveStyleFactorsAsync(factors, token);
+            // Without credentials (Mode None) every caller is trusted as before; a Game-only key may add styles
+            // nobody registered yet but cannot change the shared score policy.
+            var caller = Context.CallContext.GetHttpContext().Features.Get<TimerWriteClient>();
+            var mayOverwrite = caller is null || caller.Scopes.HasFlag(TimerWriteScopes.Admin);
+            await _storage.SaveStyleFactorsAsync(factors, mayOverwrite, token);
 
             return _options.UseRegisteredStyleFactors(await _storage.GetStyleFactorsAsync(token));
         });
@@ -210,7 +217,7 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
 
     public async UnaryResult UpdatePlayerMapStatsAsync(ulong steamId, string mapName, ulong workshopId, float deltaSeconds)
         => await RunAsync(token => Done(_storage.UpdatePlayerMapStatsAsync(steamId, Map(mapName), workshopId,
-                                                                           deltaSeconds, token)));
+                                                                           Delta(deltaSeconds), token)));
 
     public async UnaryResult<MapStatsDto> GetPlayerMapStatsAsync(ulong steamId, string mapName, ulong workshopId)
         => await RunAsync(async token =>
@@ -247,8 +254,8 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
                                                         int     track,
                                                         int     stage,
                                                         ulong?  steamId)
-        => await RunAsync(token => _storage.GetReplayUrlAsync(Map(mapName), workshopId, Stage(kind), style, track, stage,
-                                                              steamId, token));
+        => await RunAsync(token => _storage.GetReplayUrlAsync(Map(mapName), workshopId, Stage(kind), Style(style),
+                                                              Track(track), StageNumber(stage), steamId, token));
 
     public async UnaryResult<string?> GetRunReplayUrlAsync(ulong runId)
         => await RunAsync(token => _storage.GetRunReplayUrlAsync(runId, token));
@@ -259,6 +266,11 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
             if (runIds is null || runIds.Length == 0)
             {
                 return [];
+            }
+
+            if (runIds.Length > MaxStoredReplayLookups)
+            {
+                throw TimerWriteRpcErrors.InvalidArgument();
             }
 
             var stored = await _storage.GetStoredReplayRunIdsAsync(runIds, token);
@@ -275,7 +287,7 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
     public async UnaryResult<bool> SaveReplayUrlAsync(string mapName, ulong workshopId, ulong steamId, ulong runId, string url)
         => await RunAsync(token =>
         {
-            if (string.IsNullOrWhiteSpace(url) || !Uri.TryCreate(url, UriKind.Absolute, out _))
+            if (!IsAllowedReplayUrl(url))
             {
                 throw TimerWriteRpcErrors.InvalidArgument();
             }
@@ -285,6 +297,51 @@ public sealed class TimerStorageServiceV1 : ServiceBase<ITimerStorageServiceV1>,
 
     private static ulong Player(ulong steamId)
         => steamId != 0 ? steamId : throw TimerWriteRpcErrors.InvalidArgument();
+
+    private static int Style(int style)
+        => unchecked((uint)style) < TimerConstants.MAX_STYLE ? style : throw TimerWriteRpcErrors.InvalidArgument();
+
+    private static int Track(int track)
+        => unchecked((uint)track) < TimerConstants.MAX_TRACK ? track : throw TimerWriteRpcErrors.InvalidArgument();
+
+    private static int StageNumber(int stage)
+        => unchecked((uint)stage) < TimerConstants.MAX_STAGE ? stage : throw TimerWriteRpcErrors.InvalidArgument();
+
+    // Storage enforces the upper bound (reported as InvalidArgument by Translate); reject the rest before a DB trip.
+    private static float Delta(float deltaSeconds)
+        => float.IsFinite(deltaSeconds) && deltaSeconds >= 0f
+               ? deltaSeconds
+               : throw TimerWriteRpcErrors.InvalidArgument();
+
+    // Every game server later downloads this URL, so only http(s) and, when configured, the operator's replay store.
+    private bool IsAllowedReplayUrl(string? url)
+    {
+        if (url is not { Length: > 0 and <= MaxReplayUrlLength }
+            || !Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            || !string.IsNullOrEmpty(uri.UserInfo))
+        {
+            return false;
+        }
+
+        var prefixes = _options.ReplayUrlPrefixes;
+        if (prefixes.Count == 0)
+        {
+            return true;
+        }
+
+        // Compare the normalized form so "https://store/../other" or encoded tricks cannot escape the prefix.
+        var normalized = uri.AbsoluteUri;
+        foreach (var prefix in prefixes)
+        {
+            if (normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     private static string Map(string? mapName)
         => ApiRouteValidation.TryNormalizeMapName(mapName, out var normalized, out _)

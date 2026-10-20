@@ -185,6 +185,88 @@ public sealed class TimerWriteLoopbackTests
         Assert.Equal(StatusCode.ResourceExhausted, exception.StatusCode);
     }
 
+    [Fact]
+    public async Task ApiKeyModeAuthenticatesEveryCallAndEnforcesScopes()
+    {
+        const string gameKey = "game-key-for-loopback";
+        const string adminKey = "admin-key-for-loopback";
+        await using var server = await LoopbackServer.StartAsync(settings: new()
+        {
+            ["TimerBackend:WriteApi:Authentication:Mode"] = "ApiKey",
+            ["TimerBackend:WriteApi:Authentication:Clients:0:Name"] = "game",
+            ["TimerBackend:WriteApi:Authentication:Clients:0:KeySha256"] = Sha256Hex(gameKey),
+            ["TimerBackend:WriteApi:Authentication:Clients:0:Scopes:0"] = "Game",
+            ["TimerBackend:WriteApi:Authentication:Clients:1:Name"] = "admin",
+            ["TimerBackend:WriteApi:Authentication:Clients:1:KeySha256"] = Sha256Hex(adminKey),
+            ["TimerBackend:WriteApi:Authentication:Clients:1:Scopes:0"] = "Game",
+            ["TimerBackend:WriteApi:Authentication:Clients:1:Scopes:1"] = "Admin",
+        });
+        using var channel = GrpcChannel.ForAddress(server.Address);
+        var write = MagicOnionClient.Create<ITimerWriteServiceV1>(channel);
+        var storage = MagicOnionClient.Create<ITimerStorageServiceV1>(channel);
+
+        Assert.Equal(StatusCode.Unauthenticated, (await Assert.ThrowsAsync<RpcException>(() => CallStatusAsync(write))).StatusCode);
+        Assert.Equal(StatusCode.Unauthenticated,
+                     (await Assert.ThrowsAsync<RpcException>(() => CallStatusAsync(write.WithHeaders(Bearer("wrong-key"))))).StatusCode);
+        Assert.Equal(StatusCode.Unauthenticated,
+                     (await Assert.ThrowsAsync<RpcException>(() => CallStatusAsync(write.WithHeaders(new Metadata { { "authorization", gameKey } })))).StatusCode);
+
+        // A valid Game key reaches request validation; an Admin-only method stays closed to it.
+        Assert.Equal(StatusCode.InvalidArgument,
+                     (await Assert.ThrowsAsync<RpcException>(() => CallStatusAsync(write.WithHeaders(Bearer(gameKey))))).StatusCode);
+        Assert.Equal(StatusCode.PermissionDenied,
+                     (await Assert.ThrowsAsync<RpcException>(async () =>
+                         await storage.WithHeaders(Bearer(gameKey)).WipePlayerRunsAsync(76561198000000001, dryRun: true))).StatusCode);
+
+        // The Admin key passes the gate; the unreachable test database then reports Unavailable.
+        var admin = await Assert.ThrowsAsync<RpcException>(async () =>
+            await storage.WithHeaders(Bearer(adminKey)).WipePlayerRunsAsync(76561198000000001, dryRun: true));
+        Assert.NotEqual(StatusCode.PermissionDenied, admin.StatusCode);
+        Assert.NotEqual(StatusCode.Unauthenticated, admin.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("10.0.0.0/8", StatusCode.PermissionDenied)]
+    [InlineData("127.0.0.1", StatusCode.InvalidArgument)]
+    public async Task AllowedNetworksGateThePeerAddress(string network, StatusCode expected)
+    {
+        await using var server = await LoopbackServer.StartAsync(settings: new()
+        {
+            ["TimerBackend:WriteApi:AllowedNetworks:0"] = network,
+        });
+        using var channel = GrpcChannel.ForAddress(server.Address);
+
+        var error = await Assert.ThrowsAsync<RpcException>(() =>
+            CallStatusAsync(MagicOnionClient.Create<ITimerWriteServiceV1>(channel)));
+        Assert.Equal(expected, error.StatusCode);
+    }
+
+    [Fact]
+    public void EveryWriteRpcHasAnExplicitScope()
+    {
+        // A method missing from the map falls back to Admin; this pins that every contract method was decided.
+        string[] admin =
+        [
+            "SetMapTierAsync", "SetMapRankedAsync", "RecalculateScoresAsync", "RemoveMapRecordsAsync",
+            "DeleteRunAsync", "WipePlayerRunsAsync", "SaveZonesAsync",
+        ];
+        foreach (var service in new[] { typeof(ITimerWriteServiceV1), typeof(ITimerStorageServiceV1) })
+        {
+            foreach (var method in service.GetMethods())
+            {
+                Assert.True(TimerWriteMethodScopes.ByMethodPath.TryGetValue($"/{service.Name}/{method.Name}", out var scope),
+                            method.Name);
+                Assert.Equal(admin.Contains(method.Name) ? TimerWriteScopes.Admin : TimerWriteScopes.Game, scope);
+            }
+        }
+
+        Assert.Equal(TimerWriteScopes.Admin, TimerWriteMethodScopes.Required("/ITimerStorageServiceV1/NotYetDecidedAsync"));
+    }
+
+    private static Metadata Bearer(string key) => new () { { "authorization", $"Bearer {key}" } };
+
+    private static string Sha256Hex(string key) => Convert.ToHexString(SHA256.HashData(System.Text.Encoding.ASCII.GetBytes(key)));
+
     private static int GetFreeLoopbackPort()
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -483,9 +565,10 @@ public sealed class TimerWriteLoopbackTests
         public Task<string> RequestScheme { get; }
 
         public static async Task<LoopbackServer> StartAsync(X509Certificate2? certificate = null,
-                                                             TimerBackendStorage? storage = null)
+                                                             TimerBackendStorage? storage = null,
+                                                             Dictionary<string, string?>? settings = null)
         {
-            var options = CreateOptions();
+            var options = CreateOptions(settings);
             var loggerFactory = LoggerFactory.Create(static builder => builder.SetMinimumLevel(LogLevel.None));
             var ownsStorage = storage is null;
             storage ??= TimerBackendStorageFactory.Create(
@@ -562,14 +645,21 @@ public sealed class TimerWriteLoopbackTests
             _loggerFactory.Dispose();
         }
 
-        private static TimerWriteApiOptions CreateOptions()
+        private static TimerWriteApiOptions CreateOptions(Dictionary<string, string?>? settings)
         {
             var values = new Dictionary<string, string?>
             {
                 ["TimerBackend:WriteApi:Enabled"] = "true",
                 ["TimerBackend:WriteApi:RulesetVersion"] = "7",
                 ["TimerBackend:WriteApi:StyleFactors:0"] = "1",
+                // The listener binds port 0, so no port can be configured ahead.
+                ["TimerBackend:WriteApi:AllowAllListeners"] = "true",
             };
+            foreach (var (key, value) in settings ?? [])
+            {
+                values[key] = value;
+            }
+
             return TimerWriteApiOptions.FromConfiguration(
                 new ConfigurationBuilder().AddInMemoryCollection(values).Build());
         }

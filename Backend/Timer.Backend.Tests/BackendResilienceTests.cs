@@ -334,6 +334,141 @@ public sealed class BackendResilienceTests
     }
 
     [Fact]
+    public async Task LeaderboardCacheCannotBeBypassedOrMultipliedByClientInput()
+    {
+        using var fixture = new Fixture();
+        var map = await fixture.Store.GetMapInfo($"surf_cache_bypass_{Guid.NewGuid():N}");
+        await fixture.Store.AddPlayerRecord(new SteamID(76561198000000011UL), map.MapName, new RecordRequest { Time = 80 });
+        fixture.Owner.Start(false, false);
+        await using var app = await StartAppAsync(fixture.Owner, timeout: TimeSpan.FromSeconds(5));
+        using var client = new HttpClient { BaseAddress = Address(app) };
+        var path = $"/api/v1/maps/{map.MapName}/leaderboard?limit=5";
+
+        using var initial = await client.GetAsync(path);
+        Assert.Equal(HttpStatusCode.OK, initial.StatusCode);
+        var body = await initial.Content.ReadAsStringAsync();
+        using var gzipWarm = new HttpRequestMessage(HttpMethod.Get, path);
+        gzipWarm.Headers.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
+        using var gzipInitial = await client.SendAsync(gzipWarm);
+        Assert.Equal("gzip", gzipInitial.Content.Headers.ContentEncoding.Single());
+
+        // From here on every database read fails: only cache hits can succeed.
+        fixture.Store.Db.DbMaintenance.DropTable<RunEntity>();
+
+        using var withAuthorization = new HttpRequestMessage(HttpMethod.Get, path);
+        withAuthorization.Headers.TryAddWithoutValidation("Authorization", "x");
+        using var authorized = await client.SendAsync(withAuthorization);
+        Assert.Equal(HttpStatusCode.OK, authorized.StatusCode);
+        Assert.Equal(body, await authorized.Content.ReadAsStringAsync());
+
+        using var otherHost = new HttpRequestMessage(HttpMethod.Get, path);
+        otherHost.Headers.Host = $"cache-buster-{Guid.NewGuid():N}.example";
+        using var hosted = await client.SendAsync(otherHost);
+        Assert.Equal(HttpStatusCode.OK, hosted.StatusCode);
+
+        // The compressed entry is served as stored, not recompressed from the identity one.
+        using var gzipAgain = new HttpRequestMessage(HttpMethod.Get, path);
+        gzipAgain.Headers.TryAddWithoutValidation("Accept-Encoding", "deflate, gzip;q=0.8");
+        using var gzipHit = await client.SendAsync(gzipAgain);
+        Assert.Equal(HttpStatusCode.OK, gzipHit.StatusCode);
+        Assert.Equal("gzip", gzipHit.Content.Headers.ContentEncoding.Single());
+
+        // Other spellings of the same values are refused before any database work instead of becoming new entries.
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.GetAsync($"/api/v1/maps/{map.MapName}/leaderboard?limit=05")).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.GetAsync($"/api/v1/maps/{map.MapName}/leaderboard?limit=5&style=00")).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.GetAsync($"/api/v1/maps/%20{map.MapName}/leaderboard?limit=5")).StatusCode);
+    }
+
+    [Fact]
+    public async Task DatabaseReadsBeyondTheConcurrencyLimitAreRejected()
+    {
+        using var fixture = new Fixture();
+        fixture.Owner.Start(false, false);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        // Only the first request's SQL blocks, holding the single permit until released.
+        fixture.Store.Db.Aop.OnLogExecuting = (_, _) =>
+        {
+            if (entered.TrySetResult())
+            {
+                release.Wait(TimeSpan.FromSeconds(10));
+            }
+        };
+        await using var app = await StartAppAsync(fixture.Owner, timeout: TimeSpan.FromSeconds(10),
+            runtime: new TimerBackendRuntimeOptions { ReadConcurrencyLimit = 1, ReadQueueLimit = 0 });
+        using var client = new HttpClient { BaseAddress = Address(app) };
+
+        var first = client.GetAsync("/api/v1/maps");
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        using var second = await client.GetAsync("/api/v1/maps");
+        release.Set();
+        using var firstResponse = await first;
+
+        Assert.Equal(HttpStatusCode.OK, firstResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.TooManyRequests, second.StatusCode);
+        Assert.Contains("too_many_requests", await second.Content.ReadAsStringAsync());
+    }
+
+    [Theory]
+    [InlineData(false, HttpStatusCode.TooManyRequests)] // forwarded headers ignored: one loopback client
+    [InlineData(true, HttpStatusCode.OK)]               // trusted proxy: two different clients
+    public async Task ClientRateLimitUsesForwardedAddressesOnlyFromKnownProxies(bool trustLoopbackProxy, HttpStatusCode expected)
+    {
+        using var fixture = new Fixture();
+        fixture.Owner.Start(false, false);
+        await using var app = await StartAppAsync(fixture.Owner, timeout: TimeSpan.FromSeconds(5), runtime: new TimerBackendRuntimeOptions
+        {
+            ClientRequestsPerSecond = 1,
+            ClientRequestBurst = 1,
+            KnownProxies = trustLoopbackProxy ? [IPAddress.Loopback] : [],
+        });
+        using var client = new HttpClient { BaseAddress = Address(app) };
+
+        async Task<HttpStatusCode> GetAs(string forwardedFor)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, "/api/v1/maps");
+            request.Headers.TryAddWithoutValidation("X-Forwarded-For", forwardedFor);
+            using var response = await client.SendAsync(request);
+            return response.StatusCode;
+        }
+
+        Assert.Equal(HttpStatusCode.OK, await GetAs("203.0.113.1"));
+        Assert.Equal(expected, await GetAs("203.0.113.2"));
+    }
+
+    [Fact]
+    public async Task ConditionalRequestsAfterExpiryRefillTheLeaderboardCache()
+    {
+        using var fixture = new Fixture();
+        var map = await fixture.Store.GetMapInfo($"surf_cache_conditional_{Guid.NewGuid():N}");
+        await fixture.Store.AddPlayerRecord(new SteamID(76561198000000012UL), map.MapName, new RecordRequest { Time = 80 });
+        fixture.Owner.Start(false, false);
+        await using var app = await StartAppAsync(fixture.Owner, timeout: TimeSpan.FromSeconds(5),
+            leaderboardCacheDuration: TimeSpan.FromSeconds(1));
+        using var client = new HttpClient { BaseAddress = Address(app) };
+        var path = $"/api/v1/maps/{map.MapName}/leaderboard?limit=1";
+
+        using var initial = await client.GetAsync(path);
+        var entityTag = initial.Headers.ETag!.Tag;
+        await Task.Delay(TimeSpan.FromMilliseconds(1500)); // let the entry expire
+
+        HttpRequestMessage Conditional()
+        {
+            var request = new HttpRequestMessage(HttpMethod.Get, path);
+            request.Headers.TryAddWithoutValidation("If-None-Match", entityTag);
+            return request;
+        }
+
+        // Only polling clients remain. The first miss must still refill the entry; a 304 is never cached.
+        using var refill = await client.SendAsync(Conditional());
+        Assert.Equal(HttpStatusCode.OK, refill.StatusCode);
+
+        fixture.Store.Db.DbMaintenance.DropTable<RunEntity>();
+        using var fromCache = await client.SendAsync(Conditional());
+        Assert.Equal(HttpStatusCode.NotModified, fromCache.StatusCode);
+    }
+
+    [Fact]
     public async Task LeaderboardOutputCacheExpiresAndKeepsRouteKeysSeparate()
     {
         using var fixture = new Fixture();
@@ -618,7 +753,8 @@ public sealed class BackendResilienceTests
         bool http2 = false,
         TimeSpan? timeout = null,
         TimeSpan? leaderboardCacheDuration = null,
-        Action? onRequest = null)
+        Action? onRequest = null,
+        TimerBackendRuntimeOptions? runtime = null)
     {
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { EnvironmentName = "Testing" });
         builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 0, listener =>
@@ -626,20 +762,24 @@ public sealed class BackendResilienceTests
         builder.Services.AddSingleton(storage);
         builder.Services.AddResponseCompression();
         builder.Services.ConfigureHttpJsonOptions(BackendJsonOptions.Configure);
-        TimerBackendRuntimeRegistration.Add(builder.Services, new TimerBackendRuntimeOptions
+        var runtimeOptions = (runtime ?? new TimerBackendRuntimeOptions()) with
         {
-            RequestTimeout = timeout ?? TimeSpan.FromMilliseconds(50),
-        }, leaderboardCacheDuration);
+            RequestTimeout = timeout ?? runtime?.RequestTimeout ?? TimeSpan.FromMilliseconds(50),
+        };
+        TimerBackendRuntimeRegistration.Add(builder.Services, runtimeOptions, leaderboardCacheDuration);
         var write = WriteOptions(http2);
         builder.Services.AddSingleton(write);
         TimerWriteApiRegistration.Add(builder.Services, write);
         var app = builder.Build();
-        app.UseResponseCompression();
+        // Same order as Program.cs.
+        TimerBackendRuntimeRegistration.UseForwardedHeadersIfConfigured(app, runtimeOptions);
         app.UseExceptionHandler(exceptionApplication => exceptionApplication.Run(BackendExceptionHandling.WriteErrorAsync));
         app.Use(async (context, next) => { onRequest?.Invoke(); await next(context); });
         app.UseRouting();
         app.UseRequestTimeouts();
         app.UseOutputCache();
+        app.UseResponseCompression();
+        app.UseRateLimiter();
         TimerReadEndpoints.Map(app);
         TimerWriteApiRegistration.Map(app, write);
         await app.StartAsync();
@@ -651,7 +791,11 @@ public sealed class BackendResilienceTests
 
     private static TimerWriteApiOptions WriteOptions(bool enabled)
         => TimerWriteApiOptions.FromConfiguration(new ConfigurationBuilder().AddInMemoryCollection(
-            new Dictionary<string, string?> { ["TimerBackend:WriteApi:Enabled"] = enabled.ToString() }).Build());
+            new Dictionary<string, string?>
+            {
+                ["TimerBackend:WriteApi:Enabled"] = enabled.ToString(),
+                ["TimerBackend:WriteApi:AllowAllListeners"] = "true", // bound to port 0
+            }).Build());
 
     private sealed class Fixture : IDisposable
     {

@@ -44,11 +44,42 @@ internal static class ApiRouteValidation
         return true;
     }
 
+    /// <summary>
+    /// A map name from a REST route. Surrounding whitespace is refused rather than trimmed: each spelling would be
+    /// its own output-cache entry (paths are cached case-insensitively, so letter case is still accepted).
+    /// </summary>
+    public static bool TryParseRouteMapName(string? raw, out string mapName, out string error)
+    {
+        if (raw is { Length: > 0 } && (char.IsWhiteSpace(raw[0]) || char.IsWhiteSpace(raw[^1])))
+        {
+            mapName = string.Empty;
+            error   = "mapName must not contain surrounding whitespace.";
+            return false;
+        }
+
+        return TryNormalizeMapName(raw, out mapName, out error);
+    }
+
     public static bool TryParseSteamId(string? raw, out ulong steamId, out string error)
         => TryParseUnsignedId(raw, "steamId", out steamId, out error);
 
+    // Run ids are stored as signed 64-bit values.
     public static bool TryParseRunId(string? raw, out ulong runId, out string error)
-        => TryParseUnsignedId(raw, "runId", out runId, out error);
+    {
+        if (!TryParseUnsignedId(raw, "runId", out runId, out error))
+        {
+            return false;
+        }
+
+        if (runId > long.MaxValue)
+        {
+            runId = 0;
+            error = $"runId must be at most {long.MaxValue}.";
+            return false;
+        }
+
+        return true;
+    }
 
     public static bool TryParseLimit(string? raw, out int limit, out string error)
     {
@@ -60,7 +91,8 @@ internal static class ApiRouteValidation
             return true;
         }
 
-        if (!int.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out limit)
+        if (!IsCanonicalNumber(raw)
+            || !int.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out limit)
             || limit is < 1 or > MaximumRecordLimit)
         {
             error = $"limit must be an integer between 1 and {MaximumRecordLimit}.";
@@ -85,6 +117,7 @@ internal static class ApiRouteValidation
         error = string.Empty;
 
         if (string.IsNullOrWhiteSpace(raw)
+            || !IsCanonicalNumber(raw)
             || !ulong.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out value)
             || value == 0)
         {
@@ -110,7 +143,8 @@ internal static class ApiRouteValidation
             return true;
         }
 
-        if (!int.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
+        if (!IsCanonicalNumber(raw)
+            || !int.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed)
             || parsed < inclusiveMinimum
             || parsed >= exclusiveMaximum)
         {
@@ -121,4 +155,8 @@ internal static class ApiRouteValidation
         value = parsed;
         return true;
     }
+
+    // One spelling per value ("7", never "07"), so query values cannot multiply output-cache keys.
+    private static bool IsCanonicalNumber(string raw)
+        => raw.Length == 1 || raw[0] != '0';
 }

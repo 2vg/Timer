@@ -206,13 +206,85 @@ public sealed class TimerStorageLoopbackTests : IAsyncLifetime
         Assert.Equal(StatusCode.InvalidArgument, error.StatusCode);
     }
 
-    internal static async Task<(WebApplication, GrpcChannel, ITimerStorageServiceV1)> StartAsync(
-        TimerBackendStorage storage, bool explicitStyleFactors)
+    [Fact]
+    public async Task ReadsWithACallerChosenWorkshopItemNeverRebindOrRenameMaps()
     {
-        var settings = new Dictionary<string, string?> { ["TimerBackend:WriteApi:Enabled"] = "true" };
+        var unbound = await _client.GetMapInfoAsync("surf_rpc_unbound", 0);
+        var bound = await _client.GetMapInfoAsync("surf_rpc_bound", 555);
+
+        // Reads with another item id: the unbound map must not be claimed, the bound one must not be renamed.
+        await _client.GetZonesAsync("surf_rpc_unbound", 999);
+        await _client.GetMapRecordsAsync("surf_rpc_hijack", 555, RunKind.Main, true, 0, 0, 0, 10);
+        await _client.GetZonesAsync("surf_rpc_hijack", 555);
+
+        var profiles = await _client.GetMapProfilesAsync();
+        Assert.Equal(0UL, profiles.Single(x => x.MapId == unbound.MapId).WorkshopId);
+        Assert.Equal("surf_rpc_bound", profiles.Single(x => x.MapId == bound.MapId).MapName);
+        Assert.DoesNotContain(profiles, x => x.MapName == "surf_rpc_hijack");
+
+        // The resolved-but-not-renamed row was not cached under the read's name.
+        Assert.NotEqual(bound.MapId, (await _client.GetMapInfoAsync("surf_rpc_hijack", 0)).MapId);
+    }
+
+    [Theory]
+    [InlineData("file:///etc/passwd")]
+    [InlineData("ftp://replays.test/a")]
+    [InlineData("https://user:secret@replays.test/a")]
+    [InlineData("https://elsewhere.test/a")]
+    [InlineData("https://replays.test.evil/a")]
+    public async Task ReplayUrlsOutsideTheConfiguredStoreAreRejected(string url)
+    {
+        var (app, channel, client) = await StartAsync(_owner, explicitStyleFactors: true, new()
+        {
+            ["TimerBackend:WriteApi:ReplayUrlPrefixes:0"] = "https://replays.test/",
+        });
+        await using var _ = app;
+        using var __ = channel;
+
+        var error = await Assert.ThrowsAsync<RpcException>(async () =>
+            await client.SaveReplayUrlAsync("surf_rpc", 0, SteamId, 1, url));
+        Assert.Equal(StatusCode.InvalidArgument, error.StatusCode);
+
+        // A link into the store passes validation (false: no such run) and never creates the map.
+        Assert.False(await client.SaveReplayUrlAsync("surf_rpc_replay_missing", 0, SteamId, 1, "https://replays.test/a"));
+        Assert.DoesNotContain(await client.GetMapProfilesAsync(), x => x.MapName == "surf_rpc_replay_missing");
+    }
+
+    [Fact]
+    public async Task OutOfRangeBoardsAndPlayTimesAreInvalidArguments()
+    {
+        await _client.GetMapInfoAsync("surf_rpc_bounds", 0);
+
+        async Task<StatusCode> Status(Func<Task> call) => (await Assert.ThrowsAsync<RpcException>(call)).StatusCode;
+
+        Assert.Equal(StatusCode.InvalidArgument, await Status(async () =>
+            await _client.GetMapRecordsAsync("surf_rpc_bounds", 0, RunKind.Main, false, 64, 0, 0, 10)));
+        Assert.Equal(StatusCode.InvalidArgument, await Status(async () =>
+            await _client.GetPlayerRunsAsync("surf_rpc_bounds", 0, SteamId, 0, -1, 0, 10)));
+        Assert.Equal(StatusCode.InvalidArgument, await Status(async () =>
+            await _client.IncrementMapStatsAsync("surf_rpc_bounds", 0, float.NaN)));
+        Assert.Equal(StatusCode.InvalidArgument, await Status(async () =>
+            await _client.UpdatePlayerMapStatsAsync(SteamId, "surf_rpc_bounds", 0, float.MaxValue)));
+        Assert.Equal(StatusCode.InvalidArgument, await Status(async () =>
+            await _client.GetStoredReplayRunIdsAsync(Enumerable.Range(1, 1001).Select(x => (ulong)x).ToArray())));
+    }
+
+    internal static async Task<(WebApplication, GrpcChannel, ITimerStorageServiceV1)> StartAsync(
+        TimerBackendStorage storage, bool explicitStyleFactors, Dictionary<string, string?>? extraSettings = null)
+    {
+        var settings = new Dictionary<string, string?>
+        {
+            ["TimerBackend:WriteApi:Enabled"] = "true",
+            ["TimerBackend:WriteApi:AllowAllListeners"] = "true", // bound to port 0
+        };
         if (explicitStyleFactors)
         {
             settings["TimerBackend:WriteApi:StyleFactors:0"] = "1";
+        }
+
+        foreach (var (key, value) in extraSettings ?? [])
+        {
+            settings[key] = value;
         }
 
         var options = TimerWriteApiOptions.FromConfiguration(new ConfigurationBuilder().AddInMemoryCollection(settings).Build());

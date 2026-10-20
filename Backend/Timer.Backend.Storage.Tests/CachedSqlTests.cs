@@ -132,7 +132,7 @@ public sealed class CachedSqlTests
             Assert.Empty(await store.GetPlayerRecords(p, b));
             Assert.Equal(10f, Assert.Single(await store.GetPlayerStageRecords(p, a)).Time);
 
-            Assert.Equal(1, (await store.GetRecordCheckpoints(pa.Id)).Count);
+            Assert.Single(await store.GetRecordCheckpoints(pa.Id));
             Assert.Equal([1u, 2u], (await store.GetRecordCheckpoints(qb.Id)).Select(x => x.CheckpointIndex));
         }
 

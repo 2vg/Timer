@@ -1,6 +1,8 @@
 using System;
 using System.Reflection;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Timer.Backend.Administration;
@@ -83,21 +85,25 @@ builder.Services.AddResponseCompression();
 builder.Services.ConfigureHttpJsonOptions(BackendJsonOptions.Configure);
 TimerWriteApiRegistration.Add(builder.Services, writeApiOptions);
 
+// Slow readers may not hold a multi-MiB leaderboard (and its buffers) open for minutes: 4 KiB/s after a 5 s grace.
+builder.WebHost.ConfigureKestrel(kestrel =>
+    kestrel.Limits.MinResponseDataRate = new MinDataRate(bytesPerSecond: 4096, gracePeriod: TimeSpan.FromSeconds(5)));
+
 var app = builder.Build();
 app.Logger.LogInformation("Timer.Backend {Version}",
                           typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion);
-if (writeApiOptions.Enabled && writeApiOptions.LocalPorts.Count == 0)
-{
-    app.Logger.LogWarning(
-        "The unauthenticated write API is served on every Kestrel listener. Set {Setting} to the gRPC listener's port to restrict it.",
-        $"{TimerWriteApiOptions.SectionName}:LocalPorts");
-}
+TimerWriteApiRegistration.LogExposureWarnings(app.Logger, app.Configuration, writeApiOptions);
+DatabaseTransportCheck.LogIfUnverified(app.Logger, backendOptions.ConnectionString);
 
-app.UseResponseCompression();
+TimerBackendRuntimeRegistration.UseForwardedHeadersIfConfigured(app, runtimeOptions);
 app.UseExceptionHandler(exceptionApplication => exceptionApplication.Run(BackendExceptionHandling.WriteErrorAsync));
 app.UseRouting();
 app.UseRequestTimeouts();
 app.UseOutputCache();
+// Inside the output cache: entries hold the compressed body (keyed by encoding), so a hit is never recompressed.
+app.UseResponseCompression();
+// After the cache, so hits never take a permit; only reads that reach the database are limited.
+app.UseRateLimiter();
 TimerReadEndpoints.Map(app);
 TimerWriteApiRegistration.Map(app, writeApiOptions);
 app.Run();

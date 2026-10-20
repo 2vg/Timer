@@ -25,7 +25,7 @@ internal sealed partial class StorageServiceImpl
     {
         // An operation's own client ran the command; outside one, the flow's scoped client did.
         var elapsed = (_operationDb.Value?.Ado ?? _rootDb.Ado).SqlExecutionTime;
-        if (elapsed < SlowSqlThreshold) return;
+        if (elapsed < SlowSqlThreshold || !_logger.IsEnabled(LogLevel.Warning)) return;
 
         _logger.LogWarning("Slow SQL took {ElapsedMs} ms:{Sql}", (long) elapsed.TotalMilliseconds,
                            FormatSqlForLog(sql, parameters));
@@ -37,6 +37,9 @@ internal sealed partial class StorageServiceImpl
         if (_operationCancellation.Value.IsCancellationRequested) return;
 
         var level = IsHandledSqlRace(error.Message) ? LogLevel.Debug : LogLevel.Warning;
+        // Handled races log at Debug, normally off: skip formatting the statement for every one.
+        if (!_logger.IsEnabled(level)) return;
+
         _logger.Log(level, "SQL command failed: {Error}{Sql}", error.Message,
                     FormatSqlForLog(error.Sql, error.Parametres as SugarParameter[]));
     }
@@ -52,9 +55,16 @@ internal sealed partial class StorageServiceImpl
            || message.StartsWith("Deadlock found", StringComparison.Ordinal)
            || message.StartsWith("Lock wait timeout exceeded", StringComparison.Ordinal);
 
+    // The parameterized statement and its parameter names, never their values: those carry player names, settings,
+    // zone configs and replay URLs (personal data, and control characters a client could inject into log lines).
     private static string FormatSqlForLog(string? sql, SugarParameter[]? parameters)
     {
-        var text = UtilMethods.GetNativeSql(sql ?? string.Empty, parameters);
+        var text = sql ?? string.Empty;
+        if (parameters is { Length: > 0 })
+        {
+            text = $"{text} [{parameters.Length} parameters, values redacted]";
+        }
+
         return text.Length <= MaxLoggedSqlLength ? text : $"{text[..MaxLoggedSqlLength]}... ({text.Length} chars)";
     }
 }

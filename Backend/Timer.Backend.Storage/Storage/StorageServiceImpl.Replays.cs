@@ -63,8 +63,13 @@ internal sealed partial class StorageServiceImpl
     /// </summary>
     internal async Task<bool> SaveReplayUrlAsync(string mapName, ulong steamId, ulong runId, string url)
     {
-        var mapId = await EnsureMapIdByNameAsync(mapName);
-        var now   = DateTime.UtcNow;
+        // The run must already exist, so its map does too: never create a map row for a replay link.
+        if (await ResolveMapIdByNameAsync(mapName) is not { } mapId)
+        {
+            return false;
+        }
+
+        var now = DateTime.UtcNow;
 
         return await SaveReplayMetadataAsync(new ReplayEntity
         {

@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Concurrent;
 using System.Data;
+using System.Data.Common;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using SqlSugar;
 
 namespace Timer.Backend.Storage;
@@ -54,6 +56,14 @@ internal sealed partial class StorageServiceImpl
         var faulted = true;
         try
         {
+            // SqlSugar's async commands open a closed connection synchronously, and with auto-close every
+            // statement re-acquires one from the pool. Under load that blocks thread-pool threads on pool
+            // waits (latency spikes of seconds while the pool grows threads) and resets the session per
+            // statement. One asynchronous open per operation removes both; the pool resets the session
+            // when the connection is returned.
+            database.CurrentConnectionConfig.IsAutoCloseConnection = false;
+            await ((DbConnection)database.Ado.Connection).OpenAsync(cancellationToken);
+
             var result = await operation();
             faulted = false;
             return result;
@@ -69,7 +79,25 @@ internal sealed partial class StorageServiceImpl
         {
             _operationCancellation.Value = previous;
             _operationDb.Value = previousDb;
+            await CloseOperationConnectionAsync(database);
             ReturnClient(database, faulted);
+        }
+    }
+
+    private async Task CloseOperationConnectionAsync(SqlSugarClient database)
+    {
+        database.CurrentConnectionConfig.IsAutoCloseConnection = true;
+        try
+        {
+            if (database.Ado.Transaction is null && database.Ado.Connection.State != ConnectionState.Closed)
+            {
+                await ((DbConnection)database.Ado.Connection).CloseAsync();
+            }
+        }
+        catch (Exception exception)
+        {
+            // A broken connection fails to close; ReturnClient then discards the client.
+            _logger.LogDebug(exception, "Closing an operation's connection failed.");
         }
     }
 

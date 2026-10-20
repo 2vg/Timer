@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
+using System.Data.Common;
 using System.Threading;
 using System.Linq;
 using System.Threading.Tasks;
@@ -26,7 +28,7 @@ internal sealed partial class StorageServiceImpl
         // Map-wide and scoped seeds share a gate. Cache entries mean completed work,
         // so concurrent readers cannot observe a partially populated best-run table.
         var gate = _bestRunSeedLocks.GetOrAdd(seedKey, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(OperationCancellation);
+        await WaitSeedGateAsync(gate);
 
         try
         {
@@ -90,7 +92,7 @@ internal sealed partial class StorageServiceImpl
         }
 
         var gate = _bestRunSeedLocks.GetOrAdd((mapId, runType), _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(OperationCancellation);
+        await WaitSeedGateAsync(gate);
 
         try
         {
@@ -123,6 +125,52 @@ internal sealed partial class StorageServiceImpl
         finally
         {
             gate.Release();
+        }
+    }
+
+    // A seed can run for seconds on a large map. Waiters must not hold their operation's pooled connection
+    // meanwhile: a cold-cache burst on one map would otherwise pin a connection per waiter and starve every
+    // other request of the pool. The uncontended path (Wait(0)) costs nothing extra.
+    private async Task WaitSeedGateAsync(SemaphoreSlim gate)
+    {
+        // Only an operation's own client holds its connection open for the whole operation; the shared root
+        // client (startup, CLI, tests) auto-closes after each statement and has nothing to release. It is also
+        // shared by concurrent callers, so its Transaction can be another caller's seed and is not checked.
+        var operation = _operationDb.Value;
+
+        // Seeds run their own map-locked transaction on this client, so seed gates are always acquired before
+        // any transaction or database lock. Enforce it: a caller inside a transaction could neither release its
+        // connection below nor seed safely.
+        if (operation?.Ado.Transaction is not null)
+        {
+            throw new InvalidOperationException("Best-run seed gates must be acquired outside a transaction.");
+        }
+
+        if (gate.Wait(0))
+        {
+            return;
+        }
+
+        var connection = operation?.Ado.Connection as DbConnection;
+        var reopen = connection is { State: ConnectionState.Open };
+        if (reopen)
+        {
+            await connection!.CloseAsync();
+        }
+
+        await gate.WaitAsync(OperationCancellation);
+
+        if (reopen)
+        {
+            try
+            {
+                await connection!.OpenAsync(OperationCancellation);
+            }
+            catch
+            {
+                gate.Release();
+                throw;
+            }
         }
     }
 

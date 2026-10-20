@@ -17,6 +17,9 @@
  */
 using System;
 using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Threading;
+using System.Threading.Tasks;
 using Grpc.Net.Client;
 using MagicOnion;
 using MagicOnion.Client;
@@ -46,12 +49,18 @@ internal sealed class BackendChannel : IDisposable
             AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
         }
 
+        // A map start sends every player's lookups at once. Past the server's per-connection stream limit
+        // (100 on Kestrel), open another connection instead of queueing run submissions behind them.
+        HttpMessageHandler handler = new SocketsHttpHandler { EnableMultipleHttp2Connections = true };
+        if (options.ApiKey is { } apiKey)
+        {
+            handler = new ApiKeyHandler(apiKey, handler);
+        }
+
         _channel = GrpcChannel.ForAddress(options.Endpoint, new GrpcChannelOptions
         {
             MaxReceiveMessageSize = MaxResponseBytes,
-            // A map start sends every player's lookups at once. Past the server's per-connection stream limit
-            // (100 on Kestrel), open another connection instead of queueing run submissions behind them.
-            HttpHandler = new SocketsHttpHandler { EnableMultipleHttp2Connections = true },
+            HttpHandler           = handler,
         });
     }
 
@@ -60,4 +69,16 @@ internal sealed class BackendChannel : IDisposable
 
     public void Dispose()
         => _channel.Dispose();
+
+    // A header on the HTTP request rather than gRPC CallCredentials, which Grpc.Net.Client refuses on h2c channels.
+    private sealed class ApiKeyHandler(string apiKey, HttpMessageHandler inner) : DelegatingHandler(inner)
+    {
+        private readonly AuthenticationHeaderValue _authorization = new ("Bearer", apiKey);
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            request.Headers.Authorization = _authorization;
+            return base.SendAsync(request, cancellationToken);
+        }
+    }
 }

@@ -109,19 +109,21 @@ public sealed class ScoreRecalcSchedulerTests
             return 0;
         });
         scheduler.Start();
-        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        // These waits bound events that must happen; cancellation callbacks run on the thread pool, which a
+        // loaded parallel test run can delay by seconds. The deadline under test is the 100 ms below.
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(15));
         using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
         try
         {
             var stopping = scheduler.StopAsync(deadline.Token);
-            await cancelling.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await cancelling.Task.WaitAsync(TimeSpan.FromSeconds(15));
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => stopping);
             Assert.False(release.IsSet);
             scheduler.Dispose();
             Assert.False(scheduler.Completion.IsCompleted);
         }
         finally { release.Set(); }
-        await scheduler.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+        await scheduler.Completion.WaitAsync(TimeSpan.FromSeconds(15));
     }
 
     [Fact]

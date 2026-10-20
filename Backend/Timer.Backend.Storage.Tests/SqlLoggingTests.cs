@@ -83,6 +83,18 @@ public sealed class SqlLoggingTests : IDisposable
     }
 
     [Fact]
+    public async Task LoggedSqlDoesNotContainParameterValues()
+    {
+        _storage.SlowSqlThreshold = TimeSpan.Zero;
+        var mapName = $"surf_logging_private_{Guid.NewGuid():N}";
+        await _storage.GetMapInfo(mapName);
+
+        Assert.Contains(_logger.Entries, x => x.Message.StartsWith("Slow SQL", StringComparison.Ordinal)
+                                              && x.Message.Contains("values redacted", StringComparison.Ordinal));
+        Assert.DoesNotContain(_logger.Entries, x => x.Message.Contains(mapName, StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task FastSqlIsNotLogged()
     {
         await _storage.GetMapInfo($"surf_logging_fast_{Guid.NewGuid():N}");

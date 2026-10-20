@@ -47,7 +47,8 @@ The plugin's other backend settings go there too, in snake_case
 (`rpc_deadline_milliseconds`, `batch_size`, ...). ModSharp's `core.json` is not
 read for them.
 
-An endpoint alone is enough; no server ID, API key or TLS proxy is required. Submission IDs are globally unique GUIDs, so
+An endpoint alone is enough with the default `WriteApi:Authentication:Mode=None`; no server ID or TLS proxy is
+required. With `ApiKey` authentication add the server's key as `"api_key"` next to `endpoint`. Submission IDs are globally unique GUIDs, so
 several game servers can send the same map/style/track to one backend.
 For a separate game-server host, replace the loopback addresses on the gRPC
 listener and plugin endpoint with addresses on your private network. Start the
@@ -249,14 +250,55 @@ The optional settings below default to what a single backend serving game server
   replace the registered ones entirely; an omitted style is then disabled.
 - `WriteApi:LocalPorts` lists the local listener ports that serve write RPCs,
   e.g. `[5082]`, which is the default with the default listeners. Kestrel routes every endpoint on every listener, so without it
-  the write service is also reachable on the read port whenever that port speaks
+  the write service would also be reachable on the read port whenever that port speaks
   HTTP/2 (for example HTTPS with the default protocols). The check uses the
   connection's local port, not the client-supplied host header; calls on other
-  listeners get `Unimplemented`. The host logs a warning when the write API is
-  enabled without this setting. Set it either as a JSON array or as a single
+  listeners get `Unimplemented`. When you configure your own `Kestrel:Endpoints` or `urls`, the default no longer
+  applies: an enabled write API with empty `LocalPorts` refuses to start. Set it either as a JSON array or as a single
   value (`TimerBackend__WriteApi__LocalPorts=5082`), not both. It only applies to
-  TCP listeners: a Unix-socket or named-pipe listener has no local port, so leave
-  `LocalPorts` unset if the gRPC proxy connects that way.
+  TCP listeners: a Unix-socket or named-pipe listener has no local port, so set
+  `WriteApi:AllowAllListeners=true` instead if the gRPC proxy connects that way.
+- `WriteApi:AllowedNetworks` (optional) lists the peer addresses or CIDR networks, e.g. `["10.0.0.0/8", "203.0.113.7"]`,
+  that may call write RPCs; others get `PermissionDenied`. It checks the direct TCP peer, or the forwarded client
+  address only for proxies listed in `Runtime:ForwardedHeaders`, so behind an unlisted gRPC proxy list the proxy. A Unix-socket peer has no address and never matches. Empty
+  allows any peer.
+- `WriteApi:Authentication:Mode` is `None` (default) or `ApiKey`. `None` keeps today's behaviour: anyone who reaches
+  the write listener is trusted, so restrict it by firewall or `AllowedNetworks`; the host logs a warning when it is
+  served on a non-loopback address with neither. `ApiKey` requires every call to send `authorization: Bearer <key>`
+  (missing or unknown keys get `Unauthenticated`) and gives each game server only the scopes it needs:
+
+  ```jsonc
+  "Authentication": {
+    "Mode": "ApiKey",
+    "Clients": [
+      { "Name": "eu1", "KeySha256": "<64 hex chars>", "Scopes": ["Game"] },
+      { "Name": "main", "KeySha256": "<64 hex chars>", "Scopes": ["Game", "Admin"] }
+    ]
+  }
+  ```
+
+  `Game` covers submissions, profiles, stats, settings, reads and replay links. `Admin` additionally allows deleting
+  runs, wiping players, removing a map's records, setting tiers or ranked status, recalculating scores and saving
+  zones (the in-game admin commands); a `Game`-only server gets `PermissionDenied` for those, and when it registers
+  style factors it can add missing styles but not change an existing factor. Admin calls are logged with the client
+  name. Only the key's SHA-256 is configured; the game server sets the key itself as `backend.api_key` in
+  `timer.jsonc`. Generate a key and its hash with:
+
+  ```sh
+  key=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '='); echo "key: $key"; printf %s "$key" | sha256sum
+  ```
+
+  ```powershell
+  $key = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).TrimEnd('=').Replace('+','-').Replace('/','_')
+  "key: $key"; [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::ASCII.GetBytes($key)))
+  ```
+
+  Keys are printable ASCII up to 256 characters. Over plain `http://` they cross the network unencrypted (the host
+  warns for non-loopback h2c listeners), so serve the write listener over HTTPS when it leaves the host.
+- `WriteApi:ReplayUrlPrefixes` (optional) lists the replay store URLs game servers may link, e.g.
+  `["https://replays.example.com/"]`. Every game server later downloads the linked file, so a replay URL must always be
+  `http`/`https`, at most 1024 characters and without credentials; with prefixes configured it must also start with
+  one of them. Set it to your `replay.storage_base_url`.
 
 With all mutation switches disabled, request handling uses typed SQLSugar reads only,
 so the backend can run with a database role limited to `SELECT` on the Timer
@@ -361,9 +403,10 @@ payload is rejected. Existing installations are cold-seeded per board before
 attempt resolution, while the steady-state path is covered by the existing
 seed cache.
 
-The first acknowledgement reads its receipt timestamp back inside the transaction.
-It therefore matches exact retries and status lookups even on existing MySQL
-DATETIME columns that retain only whole seconds.
+Receipt timestamps are stored in whole seconds, which every supported column type
+(including existing MySQL DATETIME columns) keeps exactly, so the first
+acknowledgement matches exact retries and status lookups without a read-back
+inside the map-locked transaction.
 
 Administrative record wipes retain submission receipts. An exact retry returns
 the original acknowledgement even if that run was later deleted; it never
@@ -371,9 +414,9 @@ recreates the wiped record. A receipt proves the original commit, not continued
 existence of the run. Intentionally resubmitted runs need a new submission ID.
 
 When `WriteApi:Enabled=true`, the host maps `ITimerWriteServiceV1` and
-`ITimerStorageServiceV1` without built-in API-key authentication. Anyone who can reach the write port can submit
-data; the operator is responsible for restricting network access, and should set
-`WriteApi:LocalPorts` so the read port cannot serve writes. The backend still
+`ITimerStorageServiceV1`. With the default `Authentication:Mode=None` anyone who can reach the write port can submit
+data, so the operator is responsible for restricting network access (firewall or `WriteApi:AllowedNetworks`), or
+should switch to `ApiKey`. The backend still
 owns `StyleFactor` and the accepted ruleset, never accepting client-supplied
 score policy. Incoming gRPC messages are limited to 64 KiB and responses to
 64 MiB (a whole map's leaderboards), and detailed framework errors remain
@@ -427,6 +470,25 @@ period to fit the deployment. Database contexts remain alive until active work
 finishes, even if the host's worker wait expires. Planned cancellation attempts to
 release outstanding leases without consuming retries; if SQL is unavailable,
 the persisted lease expiry allows another worker to recover.
+
+Read API protection, also under `TimerBackend:Runtime`:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `ReadConcurrencyLimit` | 32 | Database-backed REST reads (leaderboard cache misses, other queries, `/health/ready`, `/health/worker`) running at once. Anonymous traffic can never hold more of the connection pool that game-server writes also use. |
+| `ReadQueueLimit` | 1024 | Reads waiting for a slot (a cache expiry sends every concurrent reader of that board at once); beyond it the backend answers 429 `too_many_requests`. |
+| `ClientRequestsPerSecond` | 0 (off) | Per-client-IP token bucket for `/api` requests that miss the output cache. Leave it off behind a proxy until `ForwardedHeaders` is set, or every user shares the proxy's address. |
+| `ClientRequestBurst` | 2 × rate | Requests a client may burst above the rate. |
+| `ForwardedHeaders:KnownProxies` / `ForwardedHeaders:KnownNetworks` | none | Proxies (addresses / CIDR networks) whose `X-Forwarded-For`/`-Proto` is trusted. With none, forwarded headers are ignored. This also changes the peer address `WriteApi:AllowedNetworks` sees for calls through those proxies. |
+| `InternalHealthPorts` | all listeners | Local ports that serve `/health/ready` and `/health/worker` (404 elsewhere); `/health/live` stays public. |
+
+Output-cache hits never touch these limits. The leaderboard cache ignores `Authorization` and `Host` headers, keys
+on the compression encoding the client accepts (`br`, `gzip` or none) and stores compressed bodies, so a hit is never
+recompressed. Non-canonical query values (`limit=05`, `style=00`) and map names with surrounding whitespace get 400
+instead of separate cache entries. Kestrel aborts responses read slower than 4 KiB/s after a 5 s grace; cap
+connections with the standard `Kestrel:Limits:MaxConcurrentConnections` if needed. At startup the host warns when
+the database is not on loopback and the connection string does not set `SslMode=VerifyFull`/`VerifyCA`. Slow-SQL and
+SQL-error logs contain statements and parameter counts, never parameter values.
 
 Poll `GET /health/worker` on each worker-enabled instance. It returns HTTP 503
 when any persisted dead letter exists, unresolved work is older than the configured

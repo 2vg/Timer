@@ -153,14 +153,6 @@ public sealed class TimerWriteApiOptionsTests
     }
 
     [Fact]
-    public void LocalPortsDefaultToEveryListener()
-    {
-        var options = TimerWriteApiOptions.FromConfiguration(Build(EnabledValues()));
-
-        Assert.Empty(options.LocalPorts);
-    }
-
-    [Fact]
     public void LocalPortsAcceptArraysAndScalars()
     {
         var arrayValues = EnabledValues();
@@ -193,6 +185,98 @@ public sealed class TimerWriteApiOptionsTests
         var values = EnabledValues();
         values["TimerBackend:WriteApi:LocalPorts:0"] = port;
         Assert.Throws<InvalidOperationException>(() => TimerWriteApiOptions.FromConfiguration(Build(values)));
+    }
+
+    [Theory]
+    [InlineData("Mode", "Basic")]                                   // unknown mode
+    [InlineData("Mode", "ApiKey")]                                  // ApiKey without clients
+    [InlineData("Clients:0:Name", "eu1")]                           // clients while Mode is None
+    public void InvalidAuthenticationFailsFast(string key, string value)
+    {
+        var values = EnabledValues();
+        values[$"TimerBackend:WriteApi:Authentication:{key}"] = value;
+        Assert.Throws<InvalidOperationException>(() => TimerWriteApiOptions.FromConfiguration(Build(values)));
+    }
+
+    [Theory]
+    [InlineData("abc", "Game")]                                     // not a 64-hex SHA-256
+    [InlineData(KeyHash, "Owner")]                                  // unknown scope
+    [InlineData(KeyHash, null)]                                     // no scope
+    public void InvalidApiKeyClientFailsFast(string hash, string? scope)
+    {
+        var values = ApiKeyValues(hash, scope);
+        Assert.Throws<InvalidOperationException>(() => TimerWriteApiOptions.FromConfiguration(Build(values)));
+    }
+
+    [Fact]
+    public void DuplicateApiKeysFailFast()
+    {
+        var values = ApiKeyValues(KeyHash, "Game");
+        values["TimerBackend:WriteApi:Authentication:Clients:1:Name"] = "eu2";
+        values["TimerBackend:WriteApi:Authentication:Clients:1:KeySha256"] = KeyHash.ToLowerInvariant();
+        values["TimerBackend:WriteApi:Authentication:Clients:1:Scopes:0"] = "Admin";
+        Assert.Throws<InvalidOperationException>(() => TimerWriteApiOptions.FromConfiguration(Build(values)));
+    }
+
+    [Fact]
+    public void ApiKeyClientsResolveByTheKeysHash()
+    {
+        var options = TimerWriteApiOptions.FromConfiguration(Build(ApiKeyValues(KeyHash, "Game")));
+
+        Assert.Equal(Timer.Backend.WriteApi.TimerWriteAuthenticationMode.ApiKey, options.AuthenticationMode);
+        Assert.True(Timer.Backend.WriteApi.TimerWriteKeyHash.TryCompute(Key, out var hash));
+        Assert.Equal(Timer.Backend.WriteApi.TimerWriteScopes.Game, options.Clients[hash].Scopes);
+        Assert.True(Timer.Backend.WriteApi.TimerWriteKeyHash.TryCompute("other-key", out var other));
+        Assert.False(options.Clients.ContainsKey(other));
+    }
+
+    [Theory]
+    [InlineData("10.0.0.0/33")]
+    [InlineData("not-an-ip")]
+    public void InvalidAllowedNetworkFailsFast(string network)
+    {
+        var values = EnabledValues();
+        values["TimerBackend:WriteApi:AllowedNetworks:0"] = network;
+        Assert.Throws<InvalidOperationException>(() => TimerWriteApiOptions.FromConfiguration(Build(values)));
+    }
+
+    [Theory]
+    [InlineData("ftp://replays.example.com/")]
+    [InlineData("https://user:pass@replays.example.com/")]
+    [InlineData("/relative")]
+    public void InvalidReplayUrlPrefixFailsFast(string prefix)
+    {
+        var values = EnabledValues();
+        values["TimerBackend:WriteApi:ReplayUrlPrefixes:0"] = prefix;
+        Assert.Throws<InvalidOperationException>(() => TimerWriteApiOptions.FromConfiguration(Build(values)));
+    }
+
+    [Fact]
+    public void ReplayUrlPrefixesEndWithASlash()
+    {
+        // Without it "https://store/replays" would also admit "https://store/replays-evil/...".
+        var values = EnabledValues();
+        values["TimerBackend:WriteApi:ReplayUrlPrefixes:0"] = "https://replays.example.com/replays";
+        Assert.Equal(["https://replays.example.com/replays/"],
+                     TimerWriteApiOptions.FromConfiguration(Build(values)).ReplayUrlPrefixes);
+    }
+
+    internal const string Key = "test-key-3f9b6c";
+    // SHA-256 of Key (printf %s test-key-3f9b6c | sha256sum), upper-case to prove the hex is case-insensitive.
+    internal const string KeyHash = "2985812DBFFDFEA793A158FE4BB108262A357A743E559F8EA7A6F4EE9E3FC0F4";
+
+    private static Dictionary<string, string?> ApiKeyValues(string hash, string? scope)
+    {
+        var values = EnabledValues();
+        values["TimerBackend:WriteApi:Authentication:Mode"] = "ApiKey";
+        values["TimerBackend:WriteApi:Authentication:Clients:0:Name"] = "eu1";
+        values["TimerBackend:WriteApi:Authentication:Clients:0:KeySha256"] = hash;
+        if (scope is not null)
+        {
+            values["TimerBackend:WriteApi:Authentication:Clients:0:Scopes:0"] = scope;
+        }
+
+        return values;
     }
 
     private static Dictionary<string, string?> EnabledValues() => new()

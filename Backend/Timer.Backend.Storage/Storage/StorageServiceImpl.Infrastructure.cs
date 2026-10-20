@@ -39,24 +39,35 @@ internal sealed partial class StorageServiceImpl
                && (GetWorkshopId(mapKey) is var workshopId && (workshopId == 0 || _resolvedWorkshopMaps.ContainsKey((mapKey, workshopId))));
     }
 
-    private void CacheMapId(string mapKey, ulong mapId)
+    private void CacheMapId(string mapKey, MapEntity map)
     {
-        _mapIdCache[mapKey] = mapId;
+        // A read may resolve a renamed workshop file to the item's row before the map load renames it; that row
+        // is not this name's yet, so caching it would let a caller-chosen item id redirect the name for everyone.
+        if (!string.Equals(map.File, mapKey, StringComparison.Ordinal))
+        {
+            return;
+        }
 
-        if (GetWorkshopId(mapKey) is var workshopId and not 0)
+        _mapIdCache[mapKey] = map.MapId;
+
+        // Only a binding the row actually carries is trusted for the name cache. A caller's unrelated item id
+        // must neither skip resolution later nor add an entry per id it invents.
+        if (GetWorkshopId(mapKey) is var workshopId and not 0 && map.WorkshopId == workshopId)
         {
             _resolvedWorkshopMaps[(mapKey, workshopId)] = 0;
         }
     }
 
-    private Task<MapEntity?> FindMapAsync(string mapKey)
+    // Only loading or creating a map (mayRebind) may carry a workshop item over to a renamed file or claim a row for
+    // an item; reads resolve without changing which row a name or item refers to.
+    private Task<MapEntity?> FindMapAsync(string mapKey, bool mayRebind)
         => GetWorkshopId(mapKey) is var workshopId and not 0
-               ? FindWorkshopMapAsync(mapKey, workshopId)
+               ? FindWorkshopMapAsync(mapKey, workshopId, mayRebind)
                : FindMapByNameAsync(mapKey);
 
     // A workshop map is identified by its item, not its file name: carry the item's row over to a
     // renamed file, or claim the row stored under this name.
-    private async Task<MapEntity?> FindWorkshopMapAsync(string mapKey, ulong workshopId)
+    private async Task<MapEntity?> FindWorkshopMapAsync(string mapKey, ulong workshopId, bool mayRebind)
     {
         var itemMaps = await _db.Queryable<MapEntity>()
                                 .Where(x => x.WorkshopId == workshopId)
@@ -69,6 +80,13 @@ internal sealed partial class StorageServiceImpl
         }
 
         var named = await FindMapByNameAsync(mapKey);
+
+        if (!mayRebind)
+        {
+            // Read-only: a renamed file still finds its item's row (the plugin's first reads can race its map
+            // load), but neither the name nor the item binding is written.
+            return named ?? (itemMaps.Count > 0 ? itemMaps[0] : null);
+        }
 
         if (named is null && itemMaps.Count > 0)
         {
@@ -148,14 +166,14 @@ internal sealed partial class StorageServiceImpl
             return cachedMapId;
         }
 
-        var mapEntity = await FindMapAsync(mapKey);
+        var mapEntity = await FindMapAsync(mapKey, mayRebind: false);
 
         if (mapEntity is null)
         {
             return null;
         }
 
-        CacheMapId(mapKey, mapEntity.MapId);
+        CacheMapId(mapKey, mapEntity);
 
         return mapEntity.MapId;
     }
@@ -169,12 +187,14 @@ internal sealed partial class StorageServiceImpl
             return cachedMapId;
         }
 
-        return (await EnsureMapEntityByKeyAsync(mapKey, mapName)).MapId;
+        // Map-creating writes may rebind like a map load: creating a second row for a renamed workshop file
+        // would split the map's identity.
+        return (await EnsureMapEntityByKeyAsync(mapKey, mapName, mayRebind: true)).MapId;
     }
 
-    private async Task<MapEntity> EnsureMapEntityByKeyAsync(string mapKey, string mapName)
+    private async Task<MapEntity> EnsureMapEntityByKeyAsync(string mapKey, string mapName, bool mayRebind)
     {
-        var mapEntity = await FindMapAsync(mapKey);
+        var mapEntity = await FindMapAsync(mapKey, mayRebind);
 
         if (mapEntity is null)
         {
@@ -221,7 +241,7 @@ internal sealed partial class StorageServiceImpl
             }
         }
 
-        CacheMapId(mapKey, mapEntity.MapId);
+        CacheMapId(mapKey, mapEntity);
 
         return mapEntity;
     }

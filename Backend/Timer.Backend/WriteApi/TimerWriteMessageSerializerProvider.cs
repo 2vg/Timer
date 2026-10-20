@@ -17,8 +17,11 @@ internal sealed class TimerWriteMessageSerializerProvider : IMagicOnionSerialize
 {
     private readonly IMagicOnionSerializerProvider _inner;
 
+    // Requests come from the network: UntrustedData bounds nesting depth and builds dictionaries with
+    // collision-resistant comparers. It only affects deserialization, never the responses' encoding.
     public TimerWriteMessageSerializerProvider(IMagicOnionSerializerProvider? inner = null)
-        => _inner = inner ?? MessagePackMagicOnionSerializerProvider.Default;
+        => _inner = inner ?? MessagePackMagicOnionSerializerProvider.Default.WithOptions(
+               MessagePackSerializer.DefaultOptions.WithSecurity(MessagePackSecurity.UntrustedData));
 
     public IMagicOnionSerializer Create(MethodType methodType, MethodInfo? methodInfo)
         => new InvalidArgumentOnMalformedPayload(_inner.Create(methodType, methodInfo));

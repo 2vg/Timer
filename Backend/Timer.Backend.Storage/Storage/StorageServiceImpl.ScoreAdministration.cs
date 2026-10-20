@@ -509,7 +509,7 @@ internal sealed partial class StorageServiceImpl
 
         foreach (var (style, factor) in styleFactors)
         {
-            if ((uint)style >= TimerConstants.MAX_STYLE)
+            if (unchecked((uint)style) >= TimerConstants.MAX_STYLE)
             {
                 throw new ArgumentOutOfRangeException(
                     nameof(styleFactors), $"Style {style} is outside the supported range.");
