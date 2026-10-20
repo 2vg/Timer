@@ -264,13 +264,7 @@ internal unsafe partial class MovementFixModule
         }
 
         // As the block dropping into it would.
-        CallTouch(teleport, CBaseEntity_StartTouch_index, pawn);
-        CallTouch(teleport, CBaseEntity_Touch_index, pawn);
-        CallTouch(pawn, CBaseEntity_StartTouch_index, teleport);
-        CallTouch(pawn, CBaseEntity_Touch_index, teleport);
-
-        _touchingPawn[slot] = handle;
-        _touchingTriggers[slot * MaxTriggerHits + _touchingCount[slot]++] = block.Teleport;
+        TouchUntilNextTick(slot, teleport, block.Teleport, pawn, handle);
     }
 
     // Jumping off a rising block: its speed, as when it rises under them.

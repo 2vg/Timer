@@ -83,6 +83,7 @@ internal unsafe partial class MovementFixModule
     private static int VPhysicsCollisionAttribute_t_m_nInteractsWith_offset;
     private static int VPhysicsCollisionAttribute_t_m_nHierarchyId_offset;
     private static int CBasePlayerPawn_m_hController_offset;
+    private static int CBasePlayerPawn_m_pMovementServices_offset;
     private static int CCSPlayer_MovementServices_m_bDucked_offset;
     private static int CBaseTrigger_m_hTouchingEntities_offset;
     private static int CBaseTrigger_m_bDisabled_offset;
@@ -120,6 +121,7 @@ internal unsafe partial class MovementFixModule
             = schema.GetNetVarOffset("VPhysicsCollisionAttribute_t", "m_nHierarchyId");
 
         CBasePlayerPawn_m_hController_offset        = schema.GetNetVarOffset("CBasePlayerPawn", "m_hController");
+        CBasePlayerPawn_m_pMovementServices_offset  = schema.GetNetVarOffset("CBasePlayerPawn", "m_pMovementServices");
         CCSPlayer_MovementServices_m_bDucked_offset = schema.GetNetVarOffset("CCSPlayer_MovementServices", "m_bDucked");
         CBaseTrigger_m_hTouchingEntities_offset     = schema.GetNetVarOffset("CBaseTrigger", "m_hTouchingEntities");
         CBaseTrigger_m_bDisabled_offset             = schema.GetNetVarOffset("CBaseTrigger", "m_bDisabled");
@@ -231,7 +233,8 @@ internal unsafe partial class MovementFixModule
                           && _canSetVelocity
                           && CBaseEntity_StartTouch_index > 0
                           && CBaseEntity_Touch_index > 0
-                          && CBaseEntity_EndTouch_index > 0;
+                          && CBaseEntity_EndTouch_index > 0
+                          && CBasePlayerPawn_m_pMovementServices_offset > 0;
 
         if (_canQueryTriggers)
         {
@@ -244,7 +247,7 @@ internal unsafe partial class MovementFixModule
 
         if (!_canTriggerJump)
         {
-            _logger.LogWarning("The trigger jump fix is disabled, a native it needs is missing");
+            _logger.LogWarning("The trigger jump fix, path triggers and mpbhops are disabled, a native they need is missing");
         }
     }
 

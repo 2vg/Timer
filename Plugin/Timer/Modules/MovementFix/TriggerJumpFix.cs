@@ -98,6 +98,13 @@ internal unsafe partial class MovementFixModule
 
         EndTouches(slot);
 
+        // Reached earlier in the tick than the rest. After a teleport there, the player never stood or landed where the
+        // tick ended.
+        if (TouchPathTriggers(@params.Pawn, slot))
+        {
+            return;
+        }
+
         if (_bhopBlocks.Count > 0 && !_isFakeClient[slot])
         {
             ApplyBhopBlocks(@params.Pawn.GetAbsPtr(), slot);
@@ -162,10 +169,8 @@ internal unsafe partial class MovementFixModule
             return;
         }
 
-        // The game touches whatever the hull overlaps at the end of the tick itself.
-        var current      = *CBaseEntity_GetAbsOrigin(pawn);
         var currentHits  = stackalloc nint[MaxTriggerHits];
-        var currentCount = CollectTriggers(&hull, current, currentHits);
+        var currentCount = CollectGameTouches(pawn, currentHits);
 
         var handle = GetRefHandle(pawn);
 
@@ -182,15 +187,31 @@ internal unsafe partial class MovementFixModule
                 continue;
             }
 
-            // What the physics does for a pair that starts touching.
-            CallTouch(trigger, CBaseEntity_StartTouch_index, pawn);
-            CallTouch(trigger, CBaseEntity_Touch_index, pawn);
-            CallTouch(pawn, CBaseEntity_StartTouch_index, trigger);
-            CallTouch(pawn, CBaseEntity_Touch_index, trigger);
-
-            _touchingPawn[slot] = handle;
-            _touchingTriggers[slot * MaxTriggerHits + _touchingCount[slot]++] = GetRefHandle(trigger);
+            if (!TouchUntilNextTick(slot, trigger, GetRefHandle(trigger), pawn, handle))
+            {
+                return;
+            }
         }
+    }
+
+    // What the physics does for a pair that starts touching, ended on the player's next tick. False when the player has
+    // as many of these touches as they can.
+    private static bool TouchUntilNextTick(int slot, nint trigger, uint triggerHandle, nint pawn, uint pawnHandle)
+    {
+        if (_touchingCount[slot] >= MaxTriggerHits)
+        {
+            return false;
+        }
+
+        CallTouch(trigger, CBaseEntity_StartTouch_index, pawn);
+        CallTouch(trigger, CBaseEntity_Touch_index, pawn);
+        CallTouch(pawn, CBaseEntity_StartTouch_index, trigger);
+        CallTouch(pawn, CBaseEntity_Touch_index, trigger);
+
+        _touchingPawn[slot] = pawnHandle;
+        _touchingTriggers[slot * MaxTriggerHits + _touchingCount[slot]++] = triggerHandle;
+
+        return true;
     }
 
     // The player's next tick: what the physics does for a pair that stops touching.
@@ -234,6 +255,11 @@ internal unsafe partial class MovementFixModule
 
     // Every trigger the hull overlaps at point.
     private static int CollectTriggers(TraceShapeRay* ray, Vector point, nint* hits)
+        => CollectTriggers(ray, point, point, hits);
+
+    // Every trigger the hull passes through from start to end, in the order it reaches them (the ones it starts in
+    // first). A moving hull reports a trigger it comes within 1/32 of.
+    private static int CollectTriggers(TraceShapeRay* ray, Vector start, Vector end, nint* hits)
     {
         var filter = stackalloc CTraceFilter[1];
 
@@ -252,7 +278,7 @@ internal unsafe partial class MovementFixModule
         _triggerHitCount = 0;
 
         var trace = stackalloc CGameTrace[1];
-        CGamePhysicsQueryInterface_TraceShape_ManagedFilter(g_pPhysicsQuery, ray, &point, &point, filter, trace);
+        CGamePhysicsQueryInterface_TraceShape_ManagedFilter(g_pPhysicsQuery, ray, &start, &end, filter, trace);
 
         var count = _triggerHitCount;
 
@@ -262,6 +288,26 @@ internal unsafe partial class MovementFixModule
         }
 
         return count;
+    }
+
+    // The physics touches a map trigger (a mesh) the player's hull comes within about 0.1 units of, and a zone (a hull)
+    // only on overlap (measured 2026-10). One margin for both, so a map trigger is never touched twice; a zone crossed
+    // and ended less than 0.1 units past is touched by neither, as without these fixes.
+    private const float GameTouchMargin = 0.1f;
+
+    // The triggers the game touches itself where the player ends the tick.
+    private static int CollectGameTouches(nint pawn, nint* hits)
+    {
+        var service = *(nint*) (pawn + CBasePlayerPawn_m_pMovementServices_offset);
+        var height  = service != nint.Zero && *(bool*) (service + CCSPlayer_MovementServices_m_bDucked_offset) ? 54.0f : 72.0f;
+
+        var hull = new TraceShapeRay(new TraceShapeHull
+        {
+            Mins = new (-16 - GameTouchMargin, -16 - GameTouchMargin, -GameTouchMargin),
+            Maxs = new (16 + GameTouchMargin, 16 + GameTouchMargin, height + GameTouchMargin),
+        });
+
+        return CollectTriggers(&hull, *CBaseEntity_GetAbsOrigin(pawn), hits);
     }
 
     private static bool Contains(nint* entities, int count, nint entity)
