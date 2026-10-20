@@ -258,7 +258,7 @@ internal unsafe partial class MovementFixModule
 
         var handle = GetRefHandle(pawn);
 
-        if (!CanTouch(teleport, pawn, handle) || IsMarkedForDeletion(teleport))
+        if (!CanTouchUnqueried(teleport, pawn, handle) || !PassesTriggerFilters(teleport, pawn))
         {
             return;
         }

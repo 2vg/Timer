@@ -127,7 +127,7 @@ internal unsafe partial class MovementFixModule
         }
 
         var gameHits  = stackalloc nint[MaxTriggerHits];
-        var gameCount = CollectGameTouches(pawn, gameHits);
+        var gameCount = -1;
 
         var origin = *CBaseEntity_GetAbsOrigin(pawn);
         var handle = GetRefHandle(pawn);
@@ -137,12 +137,19 @@ internal unsafe partial class MovementFixModule
             var triggerHandle = _pathTriggers[slot * MaxTriggerHits + i];
             var trigger       = EntityFromHandle(triggerHandle);
 
+            if (trigger == nint.Zero || !CanTouchUnqueried(trigger, pawn, handle))
+            {
+                continue;
+            }
+
+            // Only queried once a trigger could be touched: standing in one, its touching list already rejects it.
+            if (gameCount < 0)
+            {
+                gameCount = CollectGameTouches(pawn, gameHits);
+            }
+
             // CBaseTrigger::StartTouch fires its outputs again for a player it already lists.
-            if (trigger == nint.Zero
-                || Contains(gameHits, gameCount, trigger)
-                || !CanTouch(trigger, pawn, handle)
-                || IsMarkedForDeletion(trigger)
-                || IsMarkedForDeletion(pawn))
+            if (Contains(gameHits, gameCount, trigger) || !PassesTriggerFilters(trigger, pawn))
             {
                 continue;
             }

@@ -45,9 +45,9 @@ internal unsafe partial class MovementFixModule
     private static readonly uint[] _touchingTriggers = new uint[(int) PlayerSlot.MaxPlayerCount * MaxTriggerHits];
     private static readonly int[]  _touchingCount    = new int[PlayerSlot.MaxPlayerCount];
 
-    // Filled by TriggerFilterShouldHitEntity while a trigger query runs.
-    private static readonly nint[] _triggerHits = new nint[MaxTriggerHits];
-    private static          int    _triggerHitCount;
+    // Where TriggerFilterShouldHitEntity writes while a trigger query runs.
+    private static nint* _triggerHits;
+    private static int   _triggerHitCount;
 
     private static CTraceFilterVirtualTableDescriptor* _triggerFilterVtable;
 
@@ -170,7 +170,7 @@ internal unsafe partial class MovementFixModule
         }
 
         var currentHits  = stackalloc nint[MaxTriggerHits];
-        var currentCount = CollectGameTouches(pawn, currentHits);
+        var currentCount = -1;
 
         var handle = GetRefHandle(pawn);
 
@@ -178,11 +178,19 @@ internal unsafe partial class MovementFixModule
         {
             var trigger = gapHits[i];
 
+            if (!CanTouchUnqueried(trigger, pawn, handle))
+            {
+                continue;
+            }
+
+            // Only queried once a trigger could be touched: standing in one, its touching list already rejects it.
+            if (currentCount < 0)
+            {
+                currentCount = CollectGameTouches(pawn, currentHits);
+            }
+
             // CBaseTrigger::StartTouch fires its outputs again for a player it already lists.
-            if (Contains(currentHits, currentCount, trigger)
-                || !CanTouch(trigger, pawn, handle)
-                || IsMarkedForDeletion(trigger)
-                || IsMarkedForDeletion(pawn))
+            if (Contains(currentHits, currentCount, trigger) || !PassesTriggerFilters(trigger, pawn))
             {
                 continue;
             }
@@ -275,19 +283,15 @@ internal unsafe partial class MovementFixModule
         filter->Vtable             = _triggerFilterVtable;
         filter->m_bIterateEntities = true;
 
+        _triggerHits     = hits;
         _triggerHitCount = 0;
 
         var trace = stackalloc CGameTrace[1];
         CGamePhysicsQueryInterface_TraceShape_ManagedFilter(g_pPhysicsQuery, ray, &start, &end, filter, trace);
 
-        var count = _triggerHitCount;
+        _triggerHits = null;
 
-        for (var i = 0; i < count; i++)
-        {
-            hits[i] = _triggerHits[i];
-        }
-
-        return count;
+        return _triggerHitCount;
     }
 
     // The physics touches a map trigger (a mesh) the player's hull comes within about 0.1 units of, and a zone (a hull)
@@ -323,10 +327,11 @@ internal unsafe partial class MovementFixModule
         return false;
     }
 
-    // What the game checks before StartTouch.
-    private static bool CanTouch(nint trigger, nint pawn, uint pawnHandle)
+    // What the game checks before StartTouch, but the trigger filters and whether it touches the pair itself this tick:
+    // reads only.
+    private static bool CanTouchUnqueried(nint trigger, nint pawn, uint pawnHandle)
     {
-        if (*(bool*) (trigger + CBaseTrigger_m_bDisabled_offset))
+        if (*(bool*) (trigger + CBaseTrigger_m_bDisabled_offset) || IsMarkedForDeletion(trigger) || IsMarkedForDeletion(pawn))
         {
             return false;
         }
@@ -344,7 +349,7 @@ internal unsafe partial class MovementFixModule
             }
         }
 
-        return PassesTriggerFilters(trigger, pawn);
+        return true;
     }
 
     private static bool PassesTriggerFilters(nint trigger, nint pawn)
@@ -358,7 +363,7 @@ internal unsafe partial class MovementFixModule
     [UnmanagedCallersOnly]
     private static bool TriggerFilterShouldHitEntity(CTraceFilter* filter, nint entity)
     {
-        if (entity != nint.Zero && _triggerHitCount < MaxTriggerHits && IsTrigger(entity))
+        if (entity != nint.Zero && _triggerHits != null && _triggerHitCount < MaxTriggerHits && IsTrigger(entity))
         {
             _triggerHits[_triggerHitCount++] = entity;
         }
