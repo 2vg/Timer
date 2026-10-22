@@ -287,7 +287,7 @@ internal unsafe partial class MovementFixModule
         _triggerHitCount = 0;
 
         var trace = stackalloc CGameTrace[1];
-        CGamePhysicsQueryInterface_TraceShape_ManagedFilter(g_pPhysicsQuery, ray, &start, &end, filter, trace);
+        CGamePhysicsQueryInterface_TraceShape(g_pPhysicsQuery, ray, &start, &end, filter, trace);
 
         _triggerHits = null;
 

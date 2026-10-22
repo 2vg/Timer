@@ -52,12 +52,8 @@ internal unsafe partial class MovementFixModule
     private static delegate* unmanaged<nint, nint, nint, Vector*, Vector*, Vector*, double, float, double, float, byte>
         CTriggerTeleport_BuildTeleportParams_Linux;
 
-    private static delegate* unmanaged[SuppressGCTransition]<nint, TraceShapeRay*, Vector*, Vector*, CTraceFilter*, CGameTrace*, bool>
-        CGamePhysicsQueryInterface_TraceShape;
-
-    // For filters calling back into managed code, which needs the GC transition.
     private static delegate* unmanaged<nint, TraceShapeRay*, Vector*, Vector*, CTraceFilter*, CGameTrace*, bool>
-        CGamePhysicsQueryInterface_TraceShape_ManagedFilter;
+        CGamePhysicsQueryInterface_TraceShape;
 
     // ModSharp's natives, which handle GetAbsVelocity returning by value on Linux.
     private static delegate* unmanaged<nint, Vector*>       CBaseEntity_GetAbsOrigin;
@@ -137,10 +133,6 @@ internal unsafe partial class MovementFixModule
         server.TryGetVirtualTableByName("CTraceFilterPlayerMovementCS", out CTraceFilterPlayerMovementCS_vtable);
 
         CGamePhysicsQueryInterface_TraceShape
-            = (delegate* unmanaged[SuppressGCTransition]<nint, TraceShapeRay*, Vector*, Vector*, CTraceFilter*, CGameTrace*, bool>)
-            traceShape;
-
-        CGamePhysicsQueryInterface_TraceShape_ManagedFilter
             = (delegate* unmanaged<nint, TraceShapeRay*, Vector*, Vector*, CTraceFilter*, CGameTrace*, bool>) traceShape;
 
         _canTrace = traceShape != nint.Zero && g_pPhysicsQuery != nint.Zero && CTraceFilterPlayerMovementCS_vtable != nint.Zero;
